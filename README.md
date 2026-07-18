@@ -1,5 +1,6 @@
 # claude-auto-retry
 
+[![Tests](https://github.com/xie-tj/claude-auto-retry/actions/workflows/tests.yml/badge.svg)](https://github.com/xie-tj/claude-auto-retry/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 为 Claude Code 提供 API 错误自动恢复能力：当 Claude Code 自带的重试机制最终仍因 **API 超时**或**上游服务过载**而失败时，自动恢复原会话并安全继续未完成的任务。
