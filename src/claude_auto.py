@@ -18,7 +18,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -109,7 +109,10 @@ TIMEOUT_DELAYS = ERROR_POLICIES["timeout"]["delays"]
 OVERLOADED_DELAYS = ERROR_POLICIES["overloaded"]["delays"]
 MAX_RECOVERIES = 3
 EVENT_MAX_AGE = 300
+RECOVERY_PROVENANCE_TTL = 5 * 60
 RETRY_STATE_EXPIRY = 10 * 60
+PASTE_SETTLE_DELAY = 0.25
+SUBMISSION_ACK_TIMEOUT = 5
 TEMP_MAX_MEMORY = 8 * 1024 * 1024
 STALE_RETENTION = 24 * 60 * 60
 TEMP_RETENTION = 60 * 60
@@ -472,7 +475,7 @@ def expected_recovery_path(run_id):
 def mark_expected_recovery(run_id, prompt):
     atomic_json(
         expected_recovery_path(run_id),
-        {"sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "expires_at": time.time() + 30},
+        {"sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "expires_at": time.time() + RECOVERY_PROVENANCE_TTL},
     )
 
 
@@ -608,7 +611,9 @@ def status_text(state, meta, retry_count=0, category=None, remaining=None, bindi
         return "auto: {} · recovery {}/3 in {}s · {}".format(category, retry_count, max(0, int(remaining or 0)), cancel)
     labels = {
         "ready": "auto: ready · timeout 5/15/30s · overloaded 15/30/60s",
-        "awaiting": "auto: recovery {}/3 sent · waiting".format(retry_count),
+        "submitting": "auto: recovery {}/3 submit sent · confirming".format(retry_count),
+        "awaiting": "auto: recovery {}/3 submitted · waiting".format(retry_count),
+        "unconfirmed": "auto: recovery {}/3 not confirmed · press Enter if text remains".format(retry_count),
         "paused": "auto: paused · claude-auto resume {}".format(meta.get("name", "<name>")),
         "cancelled": "auto: recovery cancelled",
         "stale": "auto: recovery event stale · manual action required",
@@ -699,6 +704,10 @@ def inject_recovery(meta, message, run_id):
         tmux_run(["send-keys", "-t", pane, "C-u"], capture=True)
         result = tmux_run(["paste-buffer", "-b", buffer_name, "-d", "-t", pane], capture=True)
         if result.returncode != 0:
+            clear_expected_recovery(run_id)
+            return False
+        time.sleep(PASTE_SETTLE_DELAY)
+        if is_paused(run_id) or (run_dir(run_id) / "cancel").exists():
             clear_expected_recovery(run_id)
             return False
         result = tmux_run(["send-keys", "-t", pane, "Enter"], capture=True)
@@ -807,6 +816,9 @@ def watchdog_main(run_id, rows):
     retry_count = 0
     retry_updated_at = time.time()
     pending = None
+    submission = None
+    deferred_failures = []
+    recovery_suppressed = False
     seen = set()
     got_session_end = False
     current_state = "ready"
@@ -814,8 +826,8 @@ def watchdog_main(run_id, rows):
     last_render = 0.0
     pane_dead_since = None
 
-    def handle(event):
-        nonlocal retry_count, retry_updated_at, pending, got_session_end, current_state, meta
+    def handle(event, deferred=False):
+        nonlocal retry_count, retry_updated_at, pending, submission, deferred_failures, recovery_suppressed, got_session_end, current_state, meta
         kind = event.get("kind")
         meta = get_meta(run_id)
         if kind == "session_start":
@@ -824,29 +836,45 @@ def watchdog_main(run_id, rows):
         if kind == "lock_blocked":
             current_state = "blocked"
             pending = None
+            submission = None
+            deferred_failures = []
             log_event(run_id, kind)
             write_status(run_id, current_state, retry_count=retry_count)
             return
         if kind == "session_end":
             got_session_end = True
             pending = None
+            submission = None
+            deferred_failures = []
             log_event(run_id, kind)
             return
         if kind == "turn_success":
             retry_count = 0
             retry_updated_at = time.time()
             pending = None
+            submission = None
+            deferred_failures = []
+            recovery_suppressed = False
             current_state = "ready"
             log_event(run_id, kind)
             write_status(run_id, current_state, retry_count=0)
             return
         if kind == "prompt_submit":
             if event.get("recovery"):
+                submission = None
                 log_event(run_id, "recovery_prompt_submitted", retry_count=retry_count)
+                if current_state in {"submitting", "unconfirmed"}:
+                    current_state = "awaiting"
+                    write_status(run_id, current_state, retry_count=retry_count)
+                    if deferred_failures:
+                        handle(deferred_failures.pop(0), deferred=True)
             else:
                 retry_count = 0
                 retry_updated_at = time.time()
                 pending = None
+                submission = None
+                deferred_failures = []
+                recovery_suppressed = False
                 current_state = "ready"
                 log_event(run_id, "manual_prompt_cancelled_recovery")
                 write_status(run_id, current_state, retry_count=0)
@@ -857,10 +885,19 @@ def watchdog_main(run_id, rows):
         if event.get("subagent"):
             log_event(run_id, "subagent_failure_observed", category=category)
             return
-        key = "{}:{}:{}".format(event.get("session_id"), event.get("prompt_id"), category)
-        if key in seen:
+        if recovery_suppressed:
+            log_event(run_id, "recovery_failure_suppressed", category=category)
             return
-        seen.add(key)
+        key = "{}:{}:{}".format(event.get("session_id"), event.get("prompt_id"), category)
+        if not deferred:
+            if key in seen:
+                return
+            seen.add(key)
+        if current_state in {"submitting", "unconfirmed"}:
+            deferred_failures.append(event)
+            log_event(run_id, "recovery_failure_deferred", category=category)
+            return
+        submission = None
         age = time.time() - float(event.get("at") or 0)
         if age > EVENT_MAX_AGE:
             pending = None
@@ -917,16 +954,30 @@ def watchdog_main(run_id, rows):
             else:
                 pane_dead_since = None
             if consume_cancel(run_id):
-                if pending:
+                if pending or submission or deferred_failures:
                     log_event(run_id, "recovery_cancelled", retry_count=retry_count)
+                recovery_suppressed = (
+                    recovery_suppressed
+                    or bool(submission)
+                    or current_state in {"unconfirmed", "awaiting"}
+                )
                 pending = None
+                submission = None
+                deferred_failures = []
                 current_state = "cancelled"
                 write_status(run_id, current_state, retry_count=retry_count)
             paused_now = is_paused(run_id)
             if paused_now and current_state != "paused":
-                if pending:
+                if pending or submission or deferred_failures:
                     log_event(run_id, "recovery_paused", retry_count=retry_count)
+                recovery_suppressed = (
+                    recovery_suppressed
+                    or bool(submission)
+                    or current_state in {"unconfirmed", "awaiting"}
+                )
                 pending = None
+                submission = None
+                deferred_failures = []
                 current_state = "paused"
                 write_status(run_id, current_state, retry_count=retry_count)
             elif current_state == "paused" and not paused_now:
@@ -944,17 +995,30 @@ def watchdog_main(run_id, rows):
                 if inject_recovery(meta, message, run_id):
                     log_event(
                         run_id,
-                        "recovery_sent",
+                        "recovery_submit_key_sent",
                         category=pending["category"],
                         retry_count=pending["number"],
                     )
-                    current_state = "awaiting"
+                    submission = {
+                        "deadline": time.monotonic() + SUBMISSION_ACK_TIMEOUT,
+                        "number": pending["number"],
+                    }
+                    current_state = "submitting"
                     write_status(run_id, current_state, retry_count=retry_count)
                 else:
                     log_event(run_id, "recovery_injection_failed", retry_count=pending["number"])
                     current_state = "stale"
                     write_status(run_id, current_state, retry_count=retry_count)
                 pending = None
+            if submission and time.monotonic() >= submission["deadline"]:
+                log_event(
+                    run_id,
+                    "recovery_submit_unconfirmed",
+                    retry_count=submission["number"],
+                )
+                submission = None
+                current_state = "unconfirmed"
+                write_status(run_id, current_state, retry_count=retry_count)
             now = time.monotonic()
             if now - last_render >= 0.25:
                 if current_state == "countdown" and pending:

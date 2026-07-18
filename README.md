@@ -48,7 +48,10 @@ Our servers are currently overloaded. Please try again later.
 1. Claude Code 的 `StopFailure` Hook 报告最终 API 失败。
 2. Hook 仅将归一化类别 `timeout` 或 `overloaded` 发送给本地 watchdog。
 3. watchdog 按退避策略倒计时。
-4. 倒计时结束后，它向该会话的精确 tmux pane 提交安全 continuation。
+4. 倒计时结束后，它将安全 continuation 粘贴到该会话的精确 tmux pane，等待 250 毫秒让 Claude Code TUI 完成粘贴处理，再发送 Enter。
+5. 只有收到 Claude Code 的 `UserPromptSubmit` Hook 后，watchdog 才会将本次恢复标记为已提交并等待回复。
+
+如果发送 Enter 后 5 秒内没有收到 Hook 确认，watchdog 会显示 `not confirmed`，并且不会自动补发第二次 Enter，以免在 Hook 延迟时重复提交。如果 continuation 仍停留在输入框中，可以手动按一次 Enter；其一次性 provenance 在五分钟内仍有效，因此会被识别为同一次自动恢复，而不是新的人工任务。
 
 终端高度至少 16 行时，底部会显示两行 watchdog 状态；较小终端自动改用 tmux pane border 状态栏。
 

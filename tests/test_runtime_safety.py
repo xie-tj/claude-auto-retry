@@ -153,6 +153,126 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(self.module.consume_expected_recovery(run_id, prompt))
         self.assertFalse(self.module.consume_expected_recovery(run_id, prompt))
 
+    def test_tmux_injection_waits_until_pasted_input_can_be_submitted(self):
+        run_id = "4" * 32
+        self.create_run(run_id)
+        clock = {"now": 0.0, "ready_at": None, "submitted": False}
+
+        def tmux_run(arguments, **_):
+            if arguments[0] == "paste-buffer":
+                clock["ready_at"] = clock["now"] + 0.2
+            elif (
+                arguments[0] == "send-keys"
+                and arguments[-1] in {"Enter", "C-m"}
+            ):
+                clock["submitted"] = clock["now"] >= clock["ready_at"]
+            return Result()
+
+        def sleep(seconds):
+            clock["now"] += seconds
+
+        prompt = self.module.recovery_message(1, "timeout")
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module.time, "sleep", side_effect=sleep
+        ):
+            self.assertTrue(
+                self.module.inject_recovery(
+                    {"main_pane": "%42"}, prompt, run_id
+                )
+            )
+        self.assertTrue(
+            clock["submitted"],
+            "submit key arrived while the TUI was still processing the paste",
+        )
+
+    def test_tmux_injection_honors_cancel_during_paste_settle_delay(self):
+        run_id = "9" * 32
+        directory = self.create_run(run_id)
+        submit_keys = []
+
+        def tmux_run(arguments, **_):
+            if (
+                arguments[0] == "send-keys"
+                and arguments[-1] in {"Enter", "C-m"}
+            ):
+                submit_keys.append(arguments)
+            return Result()
+
+        def cancel_during_settle(_):
+            (directory / "cancel").touch()
+
+        prompt = self.module.recovery_message(1, "timeout")
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module.time,
+            "sleep",
+            side_effect=cancel_during_settle,
+        ):
+            self.assertFalse(
+                self.module.inject_recovery(
+                    {"main_pane": "%12"}, prompt, run_id
+                )
+            )
+        self.assertEqual(submit_keys, [])
+        self.assertFalse(
+            self.module.consume_expected_recovery(run_id, prompt)
+        )
+
+    def test_tmux_submit_key_failure_clears_provenance(self):
+        run_id = "6" * 32
+        self.create_run(run_id)
+
+        def tmux_run(arguments, **_):
+            failed_submit = (
+                arguments[0] == "send-keys"
+                and arguments[-1] == "Enter"
+            )
+            return Result(returncode=1 if failed_submit else 0)
+
+        prompt = self.module.recovery_message(1, "timeout")
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module.time, "sleep"
+        ):
+            self.assertFalse(
+                self.module.inject_recovery(
+                    {"main_pane": "%8"}, prompt, run_id
+                )
+            )
+        self.assertFalse(
+            self.module.consume_expected_recovery(run_id, prompt)
+        )
+
+    def test_manual_enter_after_unconfirmed_submit_keeps_recovery_provenance(self):
+        run_id = "7" * 32
+        self.create_run(run_id)
+        prompt = self.module.recovery_message(1, "timeout")
+        self.module.mark_expected_recovery(run_id, prompt)
+        events = self.run_hook(
+            {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "session-1",
+                "prompt": prompt,
+            },
+            run_id,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "prompt_submit")
+        self.assertTrue(events[0]["recovery"])
+        self.assertFalse(
+            self.module.consume_expected_recovery(run_id, prompt)
+        )
+
     def test_tmux_injection_failure_clears_provenance(self):
         run_id = "e" * 32
         self.create_run(run_id)
@@ -208,6 +328,431 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.module.IPC_DIR = Path("/tmp") / ("x" * 80)
         with self.assertRaisesRegex(RuntimeError, "too long"):
             self.module.ensure_private_ipc_dir()
+
+    def test_watchdog_waits_for_prompt_submit_acknowledgement(self):
+        run_id = "5" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%10",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {
+                "timeout": {
+                    "delays": (0.01, 0.01, 0.01),
+                    "label": "请求超时",
+                }
+            },
+            clear=False,
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", return_value=True
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.module.send_run_event(
+                run_id,
+                {
+                    "kind": "recoverable_failure",
+                    "at": time.time(),
+                    "run_id": run_id,
+                    "session_id": "session-1",
+                    "prompt_id": "prompt-1",
+                    "category": "timeout",
+                    "subagent": False,
+                },
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                not in {"submitting", "awaiting"}
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "submitting",
+            )
+            self.module.send_run_event(
+                run_id,
+                {
+                    "kind": "prompt_submit",
+                    "at": time.time(),
+                    "run_id": run_id,
+                    "session_id": "session-1",
+                    "recovery": True,
+                },
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "awaiting"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "awaiting",
+            )
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+    def test_unconfirmed_submit_does_not_retry_and_manual_enter_is_acknowledged(self):
+        run_id = "8" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%11",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        injections = []
+        prompt = self.module.recovery_message(1, "timeout")
+
+        def inject(*args):
+            injections.append(args)
+            self.module.mark_expected_recovery(run_id, prompt)
+            return True
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {
+                "timeout": {
+                    "delays": (0.01, 0.01, 0.01),
+                    "label": "请求超时",
+                }
+            },
+            clear=False,
+        ), mock.patch.object(
+            self.module, "SUBMISSION_ACK_TIMEOUT", 0.05
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", side_effect=inject
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.module.send_run_event(
+                run_id,
+                {
+                    "kind": "recoverable_failure",
+                    "at": time.time(),
+                    "run_id": run_id,
+                    "session_id": "session-1",
+                    "prompt_id": "prompt-1",
+                    "category": "timeout",
+                    "subagent": False,
+                },
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "unconfirmed"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "unconfirmed",
+            )
+            self.assertEqual(len(injections), 1)
+            events = self.run_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "prompt": prompt,
+                },
+                run_id,
+            )
+            self.assertTrue(events[0]["recovery"])
+            self.module.send_run_event(run_id, events[0])
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "awaiting"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "awaiting",
+            )
+            self.assertEqual(len(injections), 1)
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+    def test_new_failure_does_not_replace_unconfirmed_submission(self):
+        run_id = "0" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%13",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        injections = []
+        prompt = self.module.recovery_message(1, "timeout")
+
+        def inject(*args):
+            injections.append(args)
+            self.module.mark_expected_recovery(run_id, prompt)
+            return True
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {
+                "timeout": {
+                    "delays": (0.01, 0.01, 0.01),
+                    "label": "请求超时",
+                }
+            },
+            clear=False,
+        ), mock.patch.object(
+            self.module, "SUBMISSION_ACK_TIMEOUT", 0.05
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", side_effect=inject
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            first = {
+                "kind": "recoverable_failure",
+                "at": time.time(),
+                "run_id": run_id,
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "category": "timeout",
+                "subagent": False,
+            }
+            self.module.send_run_event(run_id, first)
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "unconfirmed"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            second = dict(first, prompt_id="prompt-2", at=time.time())
+            self.module.send_run_event(run_id, second)
+            time.sleep(0.35)
+            self.assertEqual(len(injections), 1)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "unconfirmed",
+            )
+            events = self.run_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "prompt": prompt,
+                },
+                run_id,
+            )
+            self.assertTrue(events[0]["recovery"])
+            self.module.send_run_event(run_id, events[0])
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                not in {"countdown", "awaiting"}
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(len(injections), 1)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "countdown",
+            )
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+    def test_cancelled_acknowledged_recovery_cannot_schedule_another_enter(self):
+        run_id = "b" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%14",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        injections = []
+        prompt = self.module.recovery_message(1, "timeout")
+
+        def inject(*args):
+            injections.append(args)
+            self.module.mark_expected_recovery(run_id, prompt)
+            return True
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {
+                "timeout": {
+                    "delays": (0.01, 0.01, 0.01),
+                    "label": "请求超时",
+                }
+            },
+            clear=False,
+        ), mock.patch.object(
+            self.module, "SUBMISSION_ACK_TIMEOUT", 0.5
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", side_effect=inject
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            failure = {
+                "kind": "recoverable_failure",
+                "at": time.time(),
+                "run_id": run_id,
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "category": "timeout",
+                "subagent": False,
+            }
+            self.module.send_run_event(run_id, failure)
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "submitting"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            events = self.run_hook(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "session-1",
+                    "prompt": prompt,
+                },
+                run_id,
+            )
+            self.assertTrue(events[0]["recovery"])
+            self.module.send_run_event(run_id, events[0])
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "awaiting"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            (directory / "cancel").touch()
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "cancelled"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            (directory / "cancel").touch()
+            time.sleep(0.3)
+            self.module.send_run_event(
+                run_id,
+                dict(failure, prompt_id="prompt-2", at=time.time()),
+            )
+            time.sleep(0.35)
+            self.assertEqual(len(injections), 1)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "cancelled",
+            )
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
 
     def test_cancelled_countdown_never_injects(self):
         run_id = "f" * 32

@@ -163,7 +163,7 @@ class InstallerTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertIn(doctor.returncode, (0, 1), doctor.stderr)
-        self.assertIn("claude-auto 1.0.0", doctor.stdout)
+        self.assertIn("claude-auto 1.0.1", doctor.stdout)
         self.assertTrue(ipc_dir.is_dir())
         self.assertEqual(stat.S_IMODE(ipc_dir.stat().st_mode), 0o700)
 
