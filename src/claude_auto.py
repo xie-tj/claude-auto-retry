@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -338,7 +339,10 @@ def tmux_target_identity(target):
 
 
 def tmux_target_alive(target, expected_identity=None):
-    identity = tmux_target_identity(target)
+    try:
+        identity = tmux_target_identity(target)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
     if not identity:
         return False
     return expected_identity is None or identity == expected_identity
@@ -609,15 +613,50 @@ def recovery_message(number, category):
     ).format(number, category, ERROR_POLICIES[category]["label"])
 
 
-def status_text(state, meta, retry_count=0, category=None, remaining=None, binding=True):
+def status_text(
+    state,
+    meta,
+    retry_count=0,
+    category=None,
+    remaining=None,
+    binding=True,
+    phase=None,
+    sent_attempts=0,
+    failed_attempts=0,
+):
     if state == "countdown":
         cancel = "^b X取消" if binding else "claude-auto cancel {}".format(meta.get("name", "<name>"))
-        return "auto: {} · recovery {}/3 in {}s · {}".format(category, retry_count, max(0, int(remaining or 0)), cancel)
+        return "auto: {} · recovery {}/3 in {}s · {}".format(
+            category,
+            retry_count,
+            max(0, int(math.ceil(remaining or 0))),
+            cancel,
+        )
+    seconds = max(0, int(math.ceil(remaining or 0)))
+    if state == "submitting":
+        if phase == "initial_wait":
+            return "auto: recovery {}/3 initial Enter sent · quick retry pending · final retry in {}s".format(retry_count, seconds)
+        if phase == "quick_retry_sent":
+            return "auto: recovery {}/3 quick retry sent · final retry in {}s".format(retry_count, seconds)
+        if phase == "quick_retry_failed":
+            return "auto: recovery {}/3 quick retry failed · final retry in {}s".format(retry_count, seconds)
+        if phase == "final_retry_sent":
+            return "auto: recovery {}/3 final retry sent · confirming {}s".format(retry_count, seconds)
+        if phase == "syncing":
+            return "auto: recovery {}/3 submit detected · syncing acknowledgement".format(retry_count)
+        if phase == "final_failed":
+            return "auto: recovery {}/3 final Enter failed · manual action required · {} sent/{} failed".format(
+                retry_count, sent_attempts, failed_attempts
+            )
+        if phase == "target_lost":
+            return "auto: recovery {}/3 target pane lost · automatic submission stopped".format(retry_count)
     labels = {
         "ready": "auto: ready · timeout 5/15/30s · overloaded 15/30/60s",
         "submitting": "auto: recovery {}/3 submit sent · confirming".format(retry_count),
         "awaiting": "auto: recovery {}/3 submitted · waiting".format(retry_count),
-        "unconfirmed": "auto: recovery {}/3 not confirmed · press Enter if text remains".format(retry_count),
+        "unconfirmed": "auto: recovery {}/3 not confirmed · {} Enter sent/{} failed · press Enter if text remains".format(
+            retry_count, sent_attempts, failed_attempts
+        ),
         "paused": "auto: paused · claude-auto resume {}".format(meta.get("name", "<name>")),
         "cancelled": "auto: recovery cancelled",
         "stale": "auto: recovery event stale · manual action required",
@@ -718,18 +757,30 @@ def inject_recovery(meta, message, run_id):
         if result.returncode != 0:
             clear_expected_recovery(run_id)
             return False
-        time.sleep(SUBMIT_RETRY_DELAY)
-        if expected_recovery_path(run_id).exists():
-            if is_paused(run_id) or (run_dir(run_id) / "cancel").exists():
-                clear_expected_recovery(run_id)
-                return False
-            result = tmux_run(["send-keys", "-t", pane, "Enter"], capture=True)
-            if result.returncode != 0:
-                clear_expected_recovery(run_id)
-                return False
-        return True
+        return time.monotonic()
     finally:
         tmux_run(["delete-buffer", "-b", buffer_name], capture=True)
+
+
+def send_recovery_submit_key(meta, run_id):
+    path = expected_recovery_path(run_id)
+    lock_path = run_dir(run_id) / "expected-recovery.lock"
+    with open(lock_path, "a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        if not path.exists():
+            return "consumed"
+        if is_paused(run_id):
+            return "paused"
+        if (run_dir(run_id) / "cancel").exists():
+            return "cancelled"
+        pane = meta.get("main_pane")
+        if not pane or not tmux_target_alive(pane, meta.get("tmux_identity")):
+            return "target_lost"
+        try:
+            result = tmux_run(["send-keys", "-t", pane, "Enter"], capture=True)
+        except (OSError, subprocess.TimeoutExpired):
+            return "failed"
+        return "sent" if result.returncode == 0 else "failed"
 
 
 def log_event(run_id, kind, **fields):
@@ -868,6 +919,7 @@ def watchdog_main(run_id, rows):
             submission = None
             deferred_failures = []
             recovery_suppressed = False
+            clear_expected_recovery(run_id)
             current_state = "ready"
             log_event(run_id, kind)
             write_status(run_id, current_state, retry_count=0)
@@ -888,6 +940,7 @@ def watchdog_main(run_id, rows):
                 submission = None
                 deferred_failures = []
                 recovery_suppressed = False
+                clear_expected_recovery(run_id)
                 current_state = "ready"
                 log_event(run_id, "manual_prompt_cancelled_recovery")
                 write_status(run_id, current_state, retry_count=0)
@@ -977,6 +1030,7 @@ def watchdog_main(run_id, rows):
                 pending = None
                 submission = None
                 deferred_failures = []
+                clear_expected_recovery(run_id)
                 current_state = "cancelled"
                 write_status(run_id, current_state, retry_count=retry_count)
             paused_now = is_paused(run_id)
@@ -991,6 +1045,7 @@ def watchdog_main(run_id, rows):
                 pending = None
                 submission = None
                 deferred_failures = []
+                clear_expected_recovery(run_id)
                 current_state = "paused"
                 write_status(run_id, current_state, retry_count=retry_count)
             elif current_state == "paused" and not paused_now:
@@ -1005,33 +1060,140 @@ def watchdog_main(run_id, rows):
                 write_status(run_id, current_state, retry_count=retry_count)
             if pending and time.monotonic() >= pending["deadline"]:
                 message = recovery_message(pending["number"], pending["category"])
-                if inject_recovery(meta, message, run_id):
+                submitted_at = inject_recovery(meta, message, run_id)
+                if submitted_at is not False:
                     log_event(
                         run_id,
-                        "recovery_submit_key_sent",
+                        "recovery_submit_attempt",
+                        attempt="initial",
+                        result="sent",
                         category=pending["category"],
                         retry_count=pending["number"],
                     )
+                    if isinstance(submitted_at, bool):
+                        submitted_at = time.monotonic()
                     submission = {
-                        "deadline": time.monotonic() + SUBMISSION_ACK_TIMEOUT,
+                        "quick_deadline": submitted_at + SUBMIT_RETRY_DELAY,
+                        "final_deadline": submitted_at + SUBMISSION_ACK_TIMEOUT,
+                        "ack_deadline": None,
                         "number": pending["number"],
+                        "phase": "initial_wait",
+                        "quick_done": False,
+                        "final_done": False,
+                        "sent_attempts": 1,
+                        "failed_attempts": 0,
                     }
                     current_state = "submitting"
-                    write_status(run_id, current_state, retry_count=retry_count)
+                    write_status(
+                        run_id,
+                        current_state,
+                        retry_count=retry_count,
+                        phase=submission["phase"],
+                        sent_attempts=1,
+                        failed_attempts=0,
+                    )
                 else:
                     log_event(run_id, "recovery_injection_failed", retry_count=pending["number"])
                     current_state = "stale"
                     write_status(run_id, current_state, retry_count=retry_count)
                 pending = None
-            if submission and time.monotonic() >= submission["deadline"]:
+            now = time.monotonic()
+            if submission and not submission["quick_done"] and now >= submission["quick_deadline"]:
+                result = send_recovery_submit_key(meta, run_id)
+                submission["quick_done"] = True
+                if result == "sent":
+                    submission["sent_attempts"] += 1
+                    submission["phase"] = "quick_retry_sent"
+                elif result == "failed":
+                    submission["failed_attempts"] += 1
+                    submission["phase"] = "quick_retry_failed"
+                elif result == "consumed":
+                    submission["phase"] = "syncing"
+                elif result == "target_lost":
+                    submission["phase"] = "target_lost"
+                    submission["final_done"] = True
+                elif result in {"paused", "cancelled"}:
+                    submission = None
+                    current_state = result
+                log_event(
+                    run_id,
+                    "recovery_submit_attempt",
+                    attempt="quick_retry",
+                    result=result,
+                    retry_count=retry_count,
+                )
+                if submission:
+                    write_status(
+                        run_id,
+                        current_state,
+                        retry_count=retry_count,
+                        phase=submission["phase"],
+                        sent_attempts=submission["sent_attempts"],
+                        failed_attempts=submission["failed_attempts"],
+                    )
+                else:
+                    clear_expected_recovery(run_id)
+                    write_status(run_id, current_state, retry_count=retry_count)
+            if (
+                submission
+                and submission["phase"] not in {"syncing", "target_lost", "final_failed"}
+                and not submission["final_done"]
+                and now >= submission["final_deadline"]
+            ):
+                result = send_recovery_submit_key(meta, run_id)
+                submission["final_done"] = True
+                if result == "sent":
+                    submission["sent_attempts"] += 1
+                    submission["phase"] = "final_retry_sent"
+                    submission["ack_deadline"] = time.monotonic() + SUBMISSION_ACK_TIMEOUT
+                elif result == "consumed":
+                    submission["phase"] = "syncing"
+                elif result == "target_lost":
+                    submission["phase"] = "target_lost"
+                elif result in {"paused", "cancelled"}:
+                    submission = None
+                    current_state = result
+                else:
+                    submission["failed_attempts"] += 1
+                    submission["phase"] = "final_failed"
+                log_event(
+                    run_id,
+                    "recovery_submit_attempt",
+                    attempt="final_retry",
+                    result=result,
+                    retry_count=retry_count,
+                )
+                if submission:
+                    write_status(
+                        run_id,
+                        current_state,
+                        retry_count=retry_count,
+                        phase=submission["phase"],
+                        sent_attempts=submission["sent_attempts"],
+                        failed_attempts=submission["failed_attempts"],
+                    )
+                else:
+                    clear_expected_recovery(run_id)
+                    write_status(run_id, current_state, retry_count=retry_count)
+            if submission and submission["ack_deadline"] is not None and now >= submission["ack_deadline"]:
                 log_event(
                     run_id,
                     "recovery_submit_unconfirmed",
                     retry_count=submission["number"],
+                    sent_attempts=submission["sent_attempts"],
+                    failed_attempts=submission["failed_attempts"],
                 )
+                sent_attempts = submission["sent_attempts"]
+                failed_attempts = submission["failed_attempts"]
                 submission = None
                 current_state = "unconfirmed"
-                write_status(run_id, current_state, retry_count=retry_count)
+                write_status(
+                    run_id,
+                    current_state,
+                    retry_count=retry_count,
+                    sent_attempts=sent_attempts,
+                    failed_attempts=failed_attempts,
+                )
             now = time.monotonic()
             if now - last_render >= 0.25:
                 if current_state == "countdown" and pending:
@@ -1042,6 +1204,33 @@ def watchdog_main(run_id, rows):
                         pending["category"],
                         pending["deadline"] - now,
                         binding,
+                    )
+                elif current_state == "submitting" and submission:
+                    if submission["phase"] in {"initial_wait", "quick_retry_sent", "quick_retry_failed"}:
+                        remaining = submission["final_deadline"] - now
+                    elif submission["phase"] == "final_retry_sent":
+                        remaining = submission["ack_deadline"] - now
+                    else:
+                        remaining = None
+                    text = status_text(
+                        current_state,
+                        meta,
+                        retry_count,
+                        remaining=remaining,
+                        binding=binding,
+                        phase=submission["phase"],
+                        sent_attempts=submission["sent_attempts"],
+                        failed_attempts=submission["failed_attempts"],
+                    )
+                elif current_state == "unconfirmed":
+                    status = read_json(directory / "status.json", {})
+                    text = status_text(
+                        current_state,
+                        meta,
+                        retry_count,
+                        binding=binding,
+                        sent_attempts=status.get("sent_attempts", 0),
+                        failed_attempts=status.get("failed_attempts", 0),
                     )
                 else:
                     text = status_text(current_state, meta, retry_count, binding=binding)
