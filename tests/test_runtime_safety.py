@@ -153,19 +153,21 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertTrue(self.module.consume_expected_recovery(run_id, prompt))
         self.assertFalse(self.module.consume_expected_recovery(run_id, prompt))
 
-    def test_tmux_injection_waits_until_pasted_input_can_be_submitted(self):
+    def test_tmux_injection_retries_submit_when_pasted_input_is_not_accepted(self):
         run_id = "4" * 32
         self.create_run(run_id)
-        clock = {"now": 0.0, "ready_at": None, "submitted": False}
+        clock = {"now": 0.0, "ready_at": None, "submit_attempts": 0}
 
         def tmux_run(arguments, **_):
             if arguments[0] == "paste-buffer":
-                clock["ready_at"] = clock["now"] + 0.2
+                clock["ready_at"] = clock["now"] + 0.3
             elif (
                 arguments[0] == "send-keys"
                 and arguments[-1] in {"Enter", "C-m"}
             ):
-                clock["submitted"] = clock["now"] >= clock["ready_at"]
+                if clock["now"] >= clock["ready_at"]:
+                    clock["submit_attempts"] += 1
+                    self.module.clear_expected_recovery(run_id)
             return Result()
 
         def sleep(seconds):
@@ -184,9 +186,10 @@ class RuntimeSafetyTests(unittest.TestCase):
                     {"main_pane": "%42"}, prompt, run_id
                 )
             )
-        self.assertTrue(
-            clock["submitted"],
-            "submit key arrived while the TUI was still processing the paste",
+        self.assertEqual(
+            clock["submit_attempts"],
+            1,
+            "recovery text remained pasted because the only submit key arrived too early",
         )
 
     def test_tmux_injection_honors_cancel_during_paste_settle_delay(self):

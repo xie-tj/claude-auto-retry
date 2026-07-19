@@ -103,6 +103,7 @@ RECOVERY_PREFIX = "[claude-auto recovery "
 TARGET_EVENTS = {"StopFailure", "Stop", "SessionStart", "SessionEnd", "UserPromptSubmit"}
 ERROR_POLICIES = {
     "timeout": {"delays": (5, 15, 30), "label": "请求超时"},
+    "stream_error": {"delays": (5, 15, 30), "label": "响应流解码错误"},
     "overloaded": {"delays": (15, 30, 60), "label": "上游服务过载"},
 }
 TIMEOUT_DELAYS = ERROR_POLICIES["timeout"]["delays"]
@@ -112,6 +113,7 @@ EVENT_MAX_AGE = 300
 RECOVERY_PROVENANCE_TTL = 5 * 60
 RETRY_STATE_EXPIRY = 10 * 60
 PASTE_SETTLE_DELAY = 0.25
+SUBMIT_RETRY_DELAY = 0.25
 SUBMISSION_ACK_TIMEOUT = 5
 TEMP_MAX_MEMORY = 8 * 1024 * 1024
 STALE_RETENTION = 24 * 60 * 60
@@ -432,6 +434,8 @@ def classify_failure(payload):
         or "server is currently overloaded" in combined
     ):
         return "overloaded"
+    if "stream error: error decoding response body" in combined:
+        return "stream_error"
     if (
         "the operation timed out" in combined
         or "operation timed out" in combined
@@ -714,6 +718,15 @@ def inject_recovery(meta, message, run_id):
         if result.returncode != 0:
             clear_expected_recovery(run_id)
             return False
+        time.sleep(SUBMIT_RETRY_DELAY)
+        if expected_recovery_path(run_id).exists():
+            if is_paused(run_id) or (run_dir(run_id) / "cancel").exists():
+                clear_expected_recovery(run_id)
+                return False
+            result = tmux_run(["send-keys", "-t", pane, "Enter"], capture=True)
+            if result.returncode != 0:
+                clear_expected_recovery(run_id)
+                return False
         return True
     finally:
         tmux_run(["delete-buffer", "-b", buffer_name], capture=True)

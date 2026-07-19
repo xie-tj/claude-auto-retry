@@ -70,6 +70,16 @@ class CoreTests(unittest.TestCase):
             "overloaded",
         )
         self.assertEqual(
+            classify(
+                {
+                    "last_assistant_message": (
+                        "API Error: Stream error: error decoding response body"
+                    )
+                }
+            ),
+            "stream_error",
+        )
+        self.assertEqual(
             classify({"error_details": {"error": {"type": "service_unavailable_error"}}}),
             "overloaded",
         )
