@@ -14,6 +14,22 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 
 
+def current_process_identity():
+    pid = os.getpid()
+    stat_path = Path("/proc") / str(pid) / "stat"
+    try:
+        return "proc:" + stat_path.read_text(encoding="utf-8").split()[21]
+    except (FileNotFoundError, OSError, IndexError):
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+        return "ps:" + " ".join(result.stdout.split())
+
+
 class InstallerTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(
@@ -163,7 +179,7 @@ class InstallerTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertIn(doctor.returncode, (0, 1), doctor.stderr)
-        self.assertIn("claude-auto 1.0.1", doctor.stdout)
+        self.assertIn("claude-auto 1.0.2", doctor.stdout)
         self.assertTrue(ipc_dir.is_dir())
         self.assertEqual(stat.S_IMODE(ipc_dir.stat().st_mode), 0o700)
 
@@ -195,6 +211,67 @@ class InstallerTests(unittest.TestCase):
         )
         self.assertEqual(config["raw_claude_path"], str(self.raw_claude.absolute()))
         self.assertEqual(config["ipc_dir"], first_config["ipc_dir"])
+
+    def test_reinstall_warns_about_live_old_session_without_mutating_it(self):
+        self.install()
+        state = self.home / ".local" / "state" / "claude-auto"
+        run_id = "a" * 32
+        run_dir = state / "runs" / run_id
+        run_dir.mkdir()
+        meta = {
+            "run_id": run_id,
+            "name": "live-old",
+            "mode": "interactive",
+            "cwd": "/work/project",
+            "session_id": "00000000-0000-4000-8000-000000000000",
+            "state": "running",
+            "supervisor_pid": os.getpid(),
+            "supervisor_identity": current_process_identity(),
+            "version": "1.0.0",
+        }
+        meta_path = run_dir / "meta.json"
+        meta_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        before = meta_path.read_bytes()
+
+        result = self.install()
+
+        warning = "1 managed session started before this installation is still active"
+        self.assertIn(warning, result.stdout)
+        self.assertLess(result.stdout.index(warning), result.stdout.index("installed successfully"))
+        self.assertIn(
+            "claude --resume 00000000-0000-4000-8000-000000000000",
+            result.stdout,
+        )
+        self.assertEqual(meta_path.read_bytes(), before)
+
+    def test_reinstall_does_not_report_or_mutate_stale_session(self):
+        self.install()
+        state = self.home / ".local" / "state" / "claude-auto"
+        run_id = "b" * 32
+        run_dir = state / "runs" / run_id
+        run_dir.mkdir()
+        meta_path = run_dir / "meta.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "run_id": run_id,
+                    "mode": "interactive",
+                    "cwd": "/stale",
+                    "state": "running",
+                    "supervisor_pid": os.getpid(),
+                    "supervisor_identity": "wrong-start-time",
+                    "version": "1.0.0",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        before = meta_path.read_bytes()
+
+        result = self.install()
+
+        self.assertNotIn("started before this installation", result.stdout)
+        self.assertEqual(meta_path.read_bytes(), before)
 
     def test_shell_paths_are_quoted_and_custom_bin_uninstalls(self):
         custom_bin = self.root / f"bin $(touch {self.marker})"

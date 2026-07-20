@@ -3,7 +3,7 @@
 [![Tests](https://github.com/xie-tj/claude-auto-retry/actions/workflows/tests.yml/badge.svg)](https://github.com/xie-tj/claude-auto-retry/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-为 Claude Code 提供 API 错误自动恢复能力：当 Claude Code 自带的重试机制最终仍因 **API 超时**或**上游服务过载**而失败时，自动恢复原会话并安全继续未完成的任务。
+为 Claude Code 提供 API 错误自动恢复能力：当 Claude Code 自带的重试机制最终仍因 **API 超时**、**响应流解码中断**或**上游服务过载**而失败时，自动恢复原会话并安全继续未完成的任务。
 
 ## 为什么需要它
 
@@ -25,9 +25,9 @@ Our servers are currently overloaded. Please try again later.
 ## 功能
 
 - 等待 Claude Code 内置重试结束，只在最终失败后介入。
-- 支持 API timeout：默认等待 `5 / 15 / 30` 秒后继续。
+- 支持 API timeout 与 response stream decode error：默认等待 `5 / 15 / 30` 秒后继续。
 - 支持 upstream overloaded：默认等待 `15 / 30 / 60` 秒后继续。
-- timeout 与 overloaded 共用最多 3 次自动 continuation。
+- timeout、stream error 与 overloaded 共用最多 3 次自动 continuation。
 - 不会因为普通 HTTP 422 自动继续。
 - 子代理失败只记录，不向父会话注入 continuation。
 - 如果 Claude Code 的 `UserPromptSubmit` Hook 在倒计时结束前送达，用户手动提交的新 prompt 会取消待执行恢复。
@@ -36,7 +36,8 @@ Our servers are currently overloaded. Please try again later.
 - 十分钟没有连续故障后重置恢复计数。
 - 不会自动添加 `--dangerously-skip-permissions` 或提升权限。
 - 支持交互式终端、`claude -p`、JSON 和 `stream-json` 输出。
-- 支持全局/单会话暂停、取消、查看状态、清理和完整卸载。
+- 支持全局/单会话暂停、跳过倒计时、查看风险排序状态、清理和完整卸载。
+- 单行状态展示使用形状、文字和语义颜色，并自动适配窄终端、`NO_COLOR`、`TERM=dumb` 与非 UTF-8 输出。
 - 日志只保存时间、错误类别、恢复次数和动作，不保存 prompt、回复、工具输出、源码或完整错误文本。
 
 ## 工作原理
@@ -46,18 +47,31 @@ Our servers are currently overloaded. Please try again later.
 未来从终端启动的 `claude` 会运行在受管 tmux session 中：
 
 1. Claude Code 的 `StopFailure` Hook 报告最终 API 失败。
-2. Hook 仅将归一化类别 `timeout` 或 `overloaded` 发送给本地 watchdog。
+2. Hook 仅将归一化类别 `timeout`、`stream_error` 或 `overloaded` 发送给本地 watchdog。
 3. watchdog 按退避策略倒计时。
 4. 倒计时结束后，它将安全 continuation 粘贴到该会话的精确 tmux pane，等待 250 毫秒让 Claude Code TUI 完成粘贴处理，再发送首次 Enter。
-5. 如果尚未出现任何 `UserPromptSubmit`，watchdog 会在首次 Enter 后约 250 毫秒快速补按一次，并在首次 Enter 后 5 秒进行最后一次补按。每次补按前都会重新检查 recovery provenance、暂停/取消状态和目标 pane identity。
+5. 如果尚未出现任何 `UserPromptSubmit`，watchdog 会在首次 Enter 后约 250 毫秒快速补按一次，并在首次 Enter 后 5 秒进行最后一次补按。每次补按前都会重新检查 recovery provenance、暂停/跳过状态和目标 pane identity。
 6. 任何 `UserPromptSubmit` 都会停止后续补按：匹配 continuation 时进入等待回复状态，其他内容则视为用户接管并取消自动恢复。
 7. 最后一次补按后再等待 5 秒；仍没有提交 Hook 时才显示 `not confirmed` 并停止自动按键。
 
-一次 continuation 最多尝试三次 Enter，但仍只计为一次 `recovery n/3`。如果 Hook 已消费 recovery provenance、对应事件尚未同步到 watchdog，状态栏会显示 `submit detected · syncing acknowledgement`，期间不会继续补按。如果最终仍未确认且 continuation 还在输入框中，可以手动按一次 Enter；其一次性 provenance 在五分钟内仍有效，因此会被识别为同一次自动恢复，而不是新的人工任务。
+一次 continuation 最多尝试三次 Enter，但仍只计为一次 `Recovery N/3`。状态栏只展示用户层级的 `Submitting recovery N/3`，不暴露内部 Enter 阶段。如果最终仍未确认且 continuation 还在输入框中，状态会提示 `Submit not confirmed · press Enter if recovery remains`；此时只在 recovery 文本仍可见时手动按一次 Enter。其一次性 provenance 在五分钟内仍有效，因此会被识别为同一次自动恢复，而不是新的人工任务。
 
-终端高度至少 16 行时，底部会显示两行 watchdog 状态；较小终端自动改用 tmux pane border 状态栏。
+默认情况下，终端高度至少 16 行时会在受管窗口底部显示一行 tmux pane border 状态，并且文字只出现在精确的受管主 pane 上。如果该窗口已经自定义 `pane-border-status` 或 `pane-border-format`，不会覆盖用户配置，而是退回独立的一行 watchdog pane；终端低于 16 行时隐藏常驻展示，但恢复功能仍继续运行。正常退出和创建失败时都会恢复原有 tmux window option，包括原本的局部设置或继承关系。
 
-如果 `Ctrl-b X` 尚未被占用，它会被绑定为“取消待执行恢复”。已有 tmux 绑定不会被覆盖。
+状态示例：
+
+```text
+● Recovery ready · v1.0.2
+◔ Service overloaded · recovery 1/3 in 14s · C-b X skip
+● Submitting recovery 1/3
+● Recovery 1/3 active
+✓ Recovery 1/3 complete
+! Update installed · restart to update
+```
+
+符号会按 `cyan / green / yellow / red / dim` 表示活动、成功、提醒、错误和暂停/跳过；无法使用颜色或 Unicode 时自动切换到稳定纯文本。
+
+如果 tmux prefix table 中的 `X` 尚未被占用，它会被绑定为“跳过这一次仍在倒计时的自动恢复”。状态会显示实际 prefix（例如 `C-a X` 或 `C-b X`）；已有 tmux 绑定不会被覆盖。提交已经开始后，`skip` 不会伪称能撤回文本或取消正在执行的恢复。
 
 ### 非交互式会话
 
@@ -117,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/xie-tj/claude-auto-retry/main/insta
 3. 创建 `claude`、`claude-auto` 和 `claude-raw` 三个入口。
 4. 合并五个全局 Claude Code Hooks，不覆盖已有 settings 或 Hooks。
 5. 向当前 shell rc 添加带标记的 PATH 配置。
-6. 运行离线自检。
+6. 运行离线自检；如果安装期间仍有活动受管会话，输出只读警告和安全恢复指引，不停止、迁移或修改这些会话。
 
 安装后打开新终端，或运行安装器输出的 `source` 命令，然后验证：
 
@@ -133,7 +147,7 @@ claude-auto doctor
 ```
 
 > [!IMPORTANT]
-> 安装只影响以后启动的 Claude Code 进程。安装前已经运行的会话不会被迁移或重启；全局 Hook 可以观察其错误，但不会猜测输入目标并自动注入。
+> 安装只影响以后启动的 Claude Code 进程。活动 supervisor/watchdog 已将旧源码加载进内存，重装不会热更新或重启它们。安装器会报告仍在运行的旧会话、工作目录和可验证的 Claude session ID；会话退出后可从报告目录执行 `claude --resume <session-id>`。恢复只还原对话历史，不会重放原 CLI 调用，因此需要重新指定仍然需要的 `--effort`、`--mcp-config`、`--settings`、权限模式等启动策略。无法验证 session ID 时，安装器只建议使用 Claude Code 正常的 resume 选择，不会拿内部 run ID 拼接命令。
 
 ## 使用
 
@@ -149,7 +163,7 @@ claude
 claude-auto new --name my-project --
 ```
 
-查看状态和会话：
+查看状态和会话（异常、恢复中、更新、暂停、Ready 按风险顺序展示；TTY 仅给符号着色，管道输出保持纯文本）：
 
 ```bash
 claude-auto status
@@ -158,17 +172,25 @@ claude-auto attach <session-name>
 claude-auto logs <session-name>
 ```
 
-取消待执行恢复：
+跳过仍在倒计时的这一次恢复：
+
+```bash
+claude-auto skip <session-name>
+```
+
+`cancel` 作为兼容别名保留：
 
 ```bash
 claude-auto cancel <session-name>
 ```
 
-在受管 tmux session 中也可以使用：
+在受管 tmux session 中也可以按状态栏显示的实际 prefix 与 `X`，例如：
 
 ```text
-Ctrl-b X
+C-b X
 ```
+
+如果该 tmux session 使用 `C-a` 作为 prefix，则快捷键是 `C-a X`，不是 `C-b X`。
 
 全局暂停和恢复：
 
@@ -232,7 +254,7 @@ continuation 会要求 Claude：
 - 对删除、推送、部署、支付等副作用，先确认先前操作是否完成。
 - 如果无法安全确认副作用状态，停止并说明。
 
-这是一层安全提示和状态检查策略，不是数据库事务或 exactly-once 保证。任何基于 tmux 的输入注入都存在终端状态竞态：倒计时结束时如果用户仍在输入，自动恢复可能与人工输入冲突；本项目无法原子地读取或锁定 Claude Code 的 TUI 输入框。如果任务包含高风险副作用，请保持人工监督，或在输入前先运行 `claude-auto cancel <session-name>`。
+这是一层安全提示和状态检查策略，不是数据库事务或 exactly-once 保证。任何基于 tmux 的输入注入都存在终端状态竞态：倒计时结束时如果用户仍在输入，自动恢复可能与人工输入冲突；本项目无法原子地读取或锁定 Claude Code 的 TUI 输入框。如果任务包含高风险副作用，请保持人工监督，或在倒计时结束前运行 `claude-auto skip <session-name>`。提交开始后，`skip` 会拒绝执行，因为它无法安全撤回已经粘贴或提交的输入。
 
 ## 错误匹配
 
@@ -243,6 +265,10 @@ continuation 会要求 Claude：
 - `the operation timed out`
 - `request timed out`
 - 结构化 `timeout` / `request_timeout`
+
+### Stream error
+
+- `stream error: error decoding response body`
 
 ### Overloaded
 
@@ -264,8 +290,8 @@ API Error: 422
 - `--max-budget-usd`：跨进程重复预算上限可能增加总成本。
 - `--no-session-persistence`：无法使用 session resume。
 - `--input-format stream-json`：由上游控制器负责重试和输入语义。
-- 子代理的 timeout/overloaded：交给父 Claude 处理失败或部分结果。
-- Ctrl-C 或用户主动取消。交互式受管会话中断 attach 时会写入会话取消标记，watchdog 不会继续执行当时待发送的 continuation。
+- 子代理的 timeout/stream error/overloaded：交给父 Claude 处理失败或部分结果。
+- Ctrl-C 或用户主动取消。交互式受管会话中断 attach 时，如果恢复仍在倒计时，watchdog 会跳过这一次恢复；如果首次 Enter 已发送，则只停止后续补按，不会声称能撤回已经提交的 continuation。
 
 ## 升级
 
@@ -278,6 +304,10 @@ git pull
 ```
 
 Claude Code 版本变化后，下一次启动会自动执行离线兼容性检查。检查失败时自动注入会停用，但观察和状态信息仍保留。
+
+活动 watchdog 在 Ready 状态下每 5 秒比较已加载源码与磁盘源码的 SHA-256 指纹。安装文件变化后会持续显示 `Update installed · restart to update`；`claude-auto list/status/doctor` 也会把版本落后的活动会话提升为 `UPDATE`。它不会自动重启会话。
+
+`claude-auto doctor` 会诊断所有活动会话并按风险排序，给出可安全执行的直接动作；全局依赖或任一会话处于 ERROR 时返回非零。诊断和安装警告只读取既有状态，不保存或显示原始启动参数。
 
 本项目不会自行下载或执行自动更新。
 
@@ -317,7 +347,7 @@ claude-auto uninstall
 
 - 时间戳
 - 不透明 run ID / 受管 session 名称
-- `timeout` 或 `overloaded`
+- `timeout`、`stream_error` 或 `overloaded`
 - 恢复计数
 - 动作或状态
 

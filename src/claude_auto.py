@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -31,6 +31,7 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 GLOBAL_PAUSE = STATE_DIR / "paused"
 GLOBAL_LOCK = STATE_DIR / "global.lock"
 LIFECYCLE_LOCK_DIR = APP_DIR.parent
+GLOBAL_RECOVERY_CONTROL = STATE_DIR / "recovery-control.lock"
 BINDING_OWNER = STATE_DIR / "tmux-binding-owned"
 SCRIPT = Path(__file__).resolve()
 SETTINGS_PATH = Path(os.environ.get("CLAUDE_AUTO_SETTINGS_PATH", HOME / ".claude" / "settings.json"))
@@ -116,6 +117,8 @@ RETRY_STATE_EXPIRY = 10 * 60
 PASTE_SETTLE_DELAY = 0.25
 SUBMIT_RETRY_DELAY = 0.25
 SUBMISSION_ACK_TIMEOUT = 5
+RESULT_FEEDBACK_SECONDS = 2
+UPDATE_CHECK_INTERVAL = 5
 TEMP_MAX_MEMORY = 8 * 1024 * 1024
 STALE_RETENTION = 24 * 60 * 60
 TEMP_RETENTION = 60 * 60
@@ -245,6 +248,40 @@ def global_lock():
     handle = open(GLOBAL_LOCK, "a+")
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     return handle
+
+
+class CompositeLock:
+    def __init__(self, handles):
+        self.handles = handles
+
+    def close(self):
+        while self.handles:
+            self.handles.pop().close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        self.close()
+
+
+def recovery_control_lock(run_id=None, global_exclusive=False):
+    ensure_dirs()
+    handles = []
+    global_handle = open(GLOBAL_RECOVERY_CONTROL, "a+")
+    fcntl.flock(
+        global_handle.fileno(),
+        fcntl.LOCK_EX if global_exclusive else fcntl.LOCK_SH,
+    )
+    handles.append(global_handle)
+    if run_id:
+        run_handle = open(run_dir(run_id) / "recovery-control.lock", "a+")
+        fcntl.flock(run_handle.fileno(), fcntl.LOCK_EX)
+        handles.append(run_handle)
+    return CompositeLock(handles)
 
 
 def run_dir(run_id):
@@ -452,6 +489,17 @@ def classify_failure(payload):
     return None
 
 
+def script_fingerprint():
+    try:
+        digest = hashlib.sha256()
+        with open(SCRIPT, "rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
 def event_record(kind, run_id=None, **fields):
     record = {"at": time.time(), "kind": kind}
     if run_id:
@@ -586,9 +634,20 @@ def hook_main():
         return 0
 
     category = classify_failure(payload)
-    if not category:
-        return 0
     agent_id = payload.get("agent_id")
+    if not category:
+        send_run_event(
+            run_id,
+            event_record(
+                "unsupported_failure",
+                run_id,
+                session_id=session_id,
+                prompt_id=payload.get("prompt_id"),
+                subagent=bool(agent_id),
+                agent_id=str(agent_id) if agent_id else None,
+            ),
+        )
+        return 0
     send_run_event(
         run_id,
         event_record(
@@ -613,6 +672,138 @@ def recovery_message(number, category):
     ).format(number, category, ERROR_POLICIES[category]["label"])
 
 
+RECOVERY_LABELS = {
+    "timeout": "Timeout",
+    "stream_error": "Stream interrupted",
+    "overloaded": "Service overloaded",
+}
+
+
+STATUS_PRESENTATION = {
+    "starting": ("◔", "[~]", "cyan"),
+    "ready": ("●", "[o]", "cyan"),
+    "countdown": ("◔", "[~]", "cyan"),
+    "submitting": ("●", "[o]", "cyan"),
+    "awaiting": ("●", "[o]", "cyan"),
+    "completed": ("✓", "[+]", "green"),
+    "skipped": ("○", "[-]", "dim"),
+    "cancelled": ("○", "[-]", "dim"),
+    "paused": ("○", "[-]", "dim"),
+    "paused_global": ("○", "[-]", "dim"),
+    "update_available": ("!", "[!]", "yellow"),
+    "unconfirmed": ("!", "[!]", "yellow"),
+    "stale": ("!", "[!]", "red"),
+    "exhausted": ("!", "[!]", "red"),
+    "unsupported": ("!", "[!]", "red"),
+    "blocked": ("!", "[!]", "red"),
+    "incompatible": ("!", "[!]", "red"),
+    "target_lost": ("!", "[!]", "red"),
+}
+
+
+def tmux_status_style(state, symbol):
+    _, _, style = STATUS_PRESENTATION.get(state, ("•", "[*]", ""))
+    if not style:
+        return symbol
+    opening = "#[dim]" if style == "dim" else "#[fg={}]".format(style)
+    return opening + symbol + "#[default]"
+
+
+def ansi_status_style(state, symbol):
+    _, _, style = STATUS_PRESENTATION.get(state, ("•", "[*]", ""))
+    code = {
+        "cyan": "36",
+        "green": "32",
+        "yellow": "33",
+        "red": "31",
+        "dim": "2",
+    }.get(style)
+    return "\033[{}m{}\033[0m".format(code, symbol) if code else symbol
+
+
+def terminal_capabilities(stream=None, assume_tty=False):
+    stream = stream or sys.stdout
+    is_tty = assume_tty or bool(getattr(stream, "isatty", lambda: False)())
+    color = (
+        is_tty
+        and "NO_COLOR" not in os.environ
+        and os.environ.get("TERM", "").lower() != "dumb"
+    )
+    encoding = (getattr(stream, "encoding", None) or "utf-8").lower()
+    unicode = "utf" in encoding
+    return color, unicode
+
+
+def terminal_cell_width(text):
+    width = 0
+    for character in text:
+        category = unicodedata.category(character)
+        if category.startswith("C") or category in {"Mn", "Me"}:
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"F", "W"} else 1
+    return width
+
+
+def truncate_terminal_cells(text, width):
+    if width <= 0:
+        return ""
+    result = []
+    used = 0
+    for character in text:
+        cells = terminal_cell_width(character)
+        if used + cells > width:
+            break
+        result.append(character)
+        used += cells
+    return "".join(result)
+
+
+def present_status(state, text, width=80, color=False, unicode=True):
+    symbol, ascii_symbol, style = STATUS_PRESENTATION.get(
+        state, ("•", "[*]", "")
+    )
+    if not unicode:
+        symbol = ascii_symbol
+        text = text.replace(" · ", " | ").replace("…", "...")
+
+    width = max(0, int(width or 0))
+    symbol_width = terminal_cell_width(symbol)
+    if not width:
+        return ""
+    if symbol_width > width:
+        return truncate_terminal_cells(symbol, width)
+
+    available = max(0, width - symbol_width - 1)
+    candidates = [text]
+    if state == "countdown":
+        without_skip = re.sub(r" · C-[^ ]+ X skip$", "", text)
+        candidates.append(without_skip)
+        match = re.search(r"recovery (\d+/\d+) in (\d+)s", text, re.IGNORECASE)
+        if match:
+            candidates.append(
+                "Recovery {} {}s".format(match.group(1), match.group(2))
+            )
+
+    content = candidates[-1]
+    for candidate in candidates:
+        if terminal_cell_width(candidate) <= available:
+            content = candidate
+            break
+    if terminal_cell_width(content) > available:
+        marker = "…" if unicode else "..."
+        marker_width = terminal_cell_width(marker)
+        if marker_width <= available:
+            content = (
+                truncate_terminal_cells(content, available - marker_width) + marker
+            )
+        else:
+            content = ""
+
+    if color and style:
+        symbol = tmux_status_style(state, symbol)
+    return symbol + (" " + content if content else "")
+
+
 def status_text(
     state,
     meta,
@@ -623,48 +814,41 @@ def status_text(
     phase=None,
     sent_attempts=0,
     failed_attempts=0,
+    skip_key=None,
 ):
+    del phase, sent_attempts, failed_attempts
     if state == "countdown":
-        cancel = "^b X取消" if binding else "claude-auto cancel {}".format(meta.get("name", "<name>"))
-        return "auto: {} · recovery {}/3 in {}s · {}".format(
-            category,
+        text = "{} · recovery {}/3 in {}s".format(
+            RECOVERY_LABELS.get(category, "Recovery"),
             retry_count,
             max(0, int(math.ceil(remaining or 0))),
-            cancel,
         )
-    seconds = max(0, int(math.ceil(remaining or 0)))
+        if binding and skip_key:
+            text += " · {} skip".format(skip_key)
+        return text
     if state == "submitting":
-        if phase == "initial_wait":
-            return "auto: recovery {}/3 initial Enter sent · quick retry pending · final retry in {}s".format(retry_count, seconds)
-        if phase == "quick_retry_sent":
-            return "auto: recovery {}/3 quick retry sent · final retry in {}s".format(retry_count, seconds)
-        if phase == "quick_retry_failed":
-            return "auto: recovery {}/3 quick retry failed · final retry in {}s".format(retry_count, seconds)
-        if phase == "final_retry_sent":
-            return "auto: recovery {}/3 final retry sent · confirming {}s".format(retry_count, seconds)
-        if phase == "syncing":
-            return "auto: recovery {}/3 submit detected · syncing acknowledgement".format(retry_count)
-        if phase == "final_failed":
-            return "auto: recovery {}/3 final Enter failed · manual action required · {} sent/{} failed".format(
-                retry_count, sent_attempts, failed_attempts
-            )
-        if phase == "target_lost":
-            return "auto: recovery {}/3 target pane lost · automatic submission stopped".format(retry_count)
+        return "Submitting recovery {}/3".format(retry_count)
+    if state == "awaiting":
+        return "Recovery {}/3 active".format(retry_count)
+    if state == "completed":
+        return "Recovery {}/3 complete".format(retry_count)
     labels = {
-        "ready": "auto: ready · timeout 5/15/30s · overloaded 15/30/60s",
-        "submitting": "auto: recovery {}/3 submit sent · confirming".format(retry_count),
-        "awaiting": "auto: recovery {}/3 submitted · waiting".format(retry_count),
-        "unconfirmed": "auto: recovery {}/3 not confirmed · {} Enter sent/{} failed · press Enter if text remains".format(
-            retry_count, sent_attempts, failed_attempts
-        ),
-        "paused": "auto: paused · claude-auto resume {}".format(meta.get("name", "<name>")),
-        "cancelled": "auto: recovery cancelled",
-        "stale": "auto: recovery event stale · manual action required",
-        "exhausted": "auto: stopped after 3 recoveries · manual action required",
-        "blocked": "auto: duplicate session blocked",
-        "incompatible": "auto: compatibility check failed · observe only",
+        "ready": "Recovery ready · v{}".format(VERSION),
+        "unconfirmed": "Submit not confirmed · press Enter if recovery remains",
+        "paused_global": "Recovery paused globally · claude-auto resume",
+        "paused": "Recovery paused · claude-auto resume {}".format(meta.get("name", "<name>")),
+        "skipped": "Recovery skipped",
+        "cancelled": "Submit retries stopped",
+        "stale": "Recovery event expired · inspect session",
+        "exhausted": "Recovery stopped after 3 attempts · inspect session",
+        "unsupported": "Recovery stopped · inspect session",
+        "blocked": "Duplicate session · run claude-auto doctor",
+        "incompatible": "Compatibility issue · run claude-auto doctor",
+        "target_lost": "Target unavailable · run claude-auto doctor",
+        "update_available": "Update installed · restart to update",
+        "starting": "Starting auto-recovery…",
     }
-    return labels.get(state, "auto: {}".format(state))
+    return labels.get(state, str(state).replace("_", " ").capitalize())
 
 
 def write_status(run_id, state, **fields):
@@ -675,24 +859,242 @@ def write_status(run_id, state, **fields):
     update_meta(run_id, status=state)
 
 
-def render_watchdog_status(text, rows, meta):
-    if rows > 0:
-        width = shutil.get_terminal_size((100, max(1, rows))).columns
-        line = text[: max(1, width - 1)]
-        sys.stdout.write("\033[2J\033[H" + line)
-        if rows > 1:
-            sys.stdout.write("\n" + "events: current session only")
-        sys.stdout.flush()
-        return
-    pane = meta.get("main_pane")
-    window = meta.get("window_id")
-    if pane and window:
-        tmux_run(["select-pane", "-t", pane, "-T", text], capture=True)
-        tmux_run(["set-option", "-w", "-t", window, "pane-border-status", "bottom"], capture=True)
-        tmux_run(
-            ["set-option", "-w", "-t", window, "pane-border-format", " #{pane_title} "],
+TMUX_STOCK_BORDER_FORMATS = {
+    "#{pane_index} #{pane_title}",
+    (
+        '#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'
+        '#{?#{mouse},#[align=right]#[range=control|8]'
+        '[#{?#{window_zoomed_flag},u,z}]#[norange]'
+        '#[range=control|9][x]#[norange],}'
+    ),
+}
+TMUX_BORDER_DEFAULTS = {
+    "pane-border-status": "off",
+}
+TMUX_MAIN_PANE_OPTION = "@claude_auto_watchdog_main"
+TMUX_BORDER_OPTIONS = (
+    "pane-border-status",
+    "pane-border-format",
+    "@claude_auto_watchdog_status",
+)
+
+
+def stock_pane_border_format(value):
+    return value in TMUX_STOCK_BORDER_FORMATS
+
+
+def effective_window_option(window_id, name):
+    try:
+        result = tmux_run(
+            ["show-options", "-A", "-w", "-v", "-t", window_id, name],
             capture=True,
         )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return (result.stdout or "").rstrip("\n")
+
+
+def local_window_option_snapshot(window_id, name):
+    try:
+        presence = tmux_run(
+            ["show-options", "-w", "-q", "-t", window_id, name],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if presence.returncode != 0:
+        return None
+    if not (presence.stdout or "").rstrip("\n"):
+        return {"local": False}
+    try:
+        value = tmux_run(
+            ["show-options", "-w", "-q", "-v", "-t", window_id, name],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if value.returncode != 0:
+        return None
+    return {"local": True, "value": (value.stdout or "").rstrip("\n")}
+
+
+def local_pane_option_snapshot(pane_id, name):
+    try:
+        presence = tmux_run(
+            ["show-options", "-p", "-q", "-t", pane_id, name],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if presence.returncode != 0:
+        return None
+    if not (presence.stdout or "").rstrip("\n"):
+        return {"local": False}
+    value = tmux_run(
+        ["show-options", "-p", "-q", "-v", "-t", pane_id, name],
+        capture=True,
+    )
+    if value.returncode != 0:
+        return None
+    return {"local": True, "value": (value.stdout or "").rstrip("\n")}
+
+
+def restore_watchdog_border(meta):
+    window = meta.get("window_id")
+    snapshot = meta.get("tmux_border_snapshot")
+    owned = meta.get("tmux_border_owned")
+    if not window or not isinstance(snapshot, dict):
+        return
+    for name in TMUX_BORDER_OPTIONS:
+        saved = snapshot.get(name)
+        if not isinstance(saved, dict):
+            continue
+        if isinstance(owned, dict) and name in owned:
+            current = local_window_option_snapshot(window, name)
+            if current != {"local": True, "value": owned[name]}:
+                continue
+        try:
+            if saved.get("local"):
+                tmux_run(
+                    ["set-option", "-w", "-t", window, name, saved.get("value", "")],
+                    capture=True,
+                )
+            else:
+                tmux_run(
+                    ["set-option", "-u", "-w", "-t", window, name],
+                    capture=True,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    pane = meta.get("main_pane")
+    pane_saved = meta.get("tmux_main_pane_snapshot")
+    pane_owned = meta.get("tmux_main_pane_owned")
+    if pane and isinstance(pane_saved, dict):
+        if pane_owned is not None:
+            current = local_pane_option_snapshot(pane, TMUX_MAIN_PANE_OPTION)
+            if current != {"local": True, "value": pane_owned}:
+                return
+        try:
+            if pane_saved.get("local"):
+                tmux_run(
+                    [
+                        "set-option", "-p", "-t", pane, TMUX_MAIN_PANE_OPTION,
+                        pane_saved.get("value", ""),
+                    ],
+                    capture=True,
+                )
+            else:
+                tmux_run(
+                    ["set-option", "-u", "-p", "-t", pane, TMUX_MAIN_PANE_OPTION],
+                    capture=True,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def prepare_watchdog_display(run_id, lines):
+    if lines < 16:
+        return "hidden"
+    meta = get_meta(run_id)
+    window = meta.get("window_id")
+    pane = meta.get("main_pane")
+    if not window or not pane:
+        return "hidden"
+    for name, expected in TMUX_BORDER_DEFAULTS.items():
+        if effective_window_option(window, name) != expected:
+            return "pane"
+    if not stock_pane_border_format(
+        effective_window_option(window, "pane-border-format")
+    ):
+        return "pane"
+    snapshot = {}
+    for name in TMUX_BORDER_OPTIONS:
+        saved = local_window_option_snapshot(window, name)
+        if saved is None:
+            return "pane"
+        snapshot[name] = saved
+    pane_snapshot = local_pane_option_snapshot(pane, TMUX_MAIN_PANE_OPTION)
+    if pane_snapshot is None:
+        return "pane"
+    color, unicode = terminal_capabilities(sys.stdout, assume_tty=True)
+    status = present_status(
+        "starting", status_text("starting", meta), width=100, color=color, unicode=unicode
+    )
+    pane_format = "#{?@claude_auto_watchdog_main, #{@claude_auto_watchdog_status} ,}"
+    owned = {
+        "pane-border-status": "bottom",
+        "pane-border-format": pane_format,
+        "@claude_auto_watchdog_status": status,
+    }
+    update_meta(
+        run_id,
+        tmux_border_snapshot=snapshot,
+        tmux_main_pane_snapshot=pane_snapshot,
+        tmux_border_owned=owned,
+        tmux_main_pane_owned="1",
+    )
+    commands = (
+        ["set-option", "-p", "-t", pane, TMUX_MAIN_PANE_OPTION, "1"],
+        ["set-option", "-w", "-t", window, "@claude_auto_watchdog_status", status],
+        ["set-option", "-w", "-t", window, "pane-border-format", pane_format],
+        ["set-option", "-w", "-t", window, "pane-border-status", "bottom"],
+    )
+    try:
+        for command in commands:
+            if tmux_run(command, capture=True).returncode != 0:
+                raise OSError("tmux rejected watchdog border option")
+    except (OSError, subprocess.TimeoutExpired):
+        restore_watchdog_border(get_meta(run_id))
+        return "pane"
+    return "border"
+
+
+def pane_status(state, text, width, color, unicode):
+    line = present_status(
+        state, text, width=width, color=False, unicode=unicode
+    )
+    if not color or not line:
+        return line
+    symbol, ascii_symbol, _ = STATUS_PRESENTATION.get(state, ("•", "[*]", ""))
+    symbol = symbol if unicode else ascii_symbol
+    return ansi_status_style(state, symbol) + line[len(symbol):]
+
+
+def render_watchdog_status(state, text, mode, meta):
+    if mode == "hidden":
+        return
+    if mode == "pane":
+        width = shutil.get_terminal_size((100, 1)).columns
+        color, unicode = terminal_capabilities(sys.stdout)
+        line = pane_status(
+            state, text, width=max(1, width - 1), color=color, unicode=unicode
+        )
+        sys.stdout.write("\033[2J\033[H" + line)
+        sys.stdout.flush()
+        return
+    if mode == "border":
+        window = meta.get("window_id")
+        if not window:
+            return
+        color, unicode = terminal_capabilities(sys.stdout, assume_tty=True)
+        value = present_status(
+            state, text.replace("#", "##"), width=100, color=color, unicode=unicode
+        )
+        result = tmux_run(
+            [
+                "set-option", "-w", "-t", window,
+                "@claude_auto_watchdog_status", value,
+            ],
+            capture=True,
+        )
+        if result.returncode == 0 and meta.get("run_id"):
+            owned = meta.get("tmux_border_owned")
+            owned = dict(owned) if isinstance(owned, dict) else {}
+            owned["@claude_auto_watchdog_status"] = value
+            meta["tmux_border_owned"] = owned
+            update_meta(meta["run_id"], tmux_border_owned=owned)
 
 
 def read_pending_events(directory):
@@ -801,6 +1203,22 @@ def active_interactive_runs(exclude=None):
     return result
 
 
+def tmux_skip_key(binding, tmux_session=None):
+    if not binding or not tmux_session:
+        return None
+    try:
+        result = tmux_run(
+            ["show-options", "-v", "-t", tmux_session, "prefix"],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    prefix = (result.stdout or "").strip() if result.returncode == 0 else ""
+    if not prefix or prefix.lower() == "none":
+        return None
+    return "{} X".format(prefix)
+
+
 def prefix_x_binding():
     result = tmux_run(["list-keys", "-T", "prefix"], capture=True)
     if result.returncode != 0:
@@ -835,6 +1253,7 @@ def cleanup_run(run_id, normal):
         meta = get_meta(run_id)
     except ValueError:
         return
+    restore_watchdog_border(meta)
     release_named_lock("session", meta.get("session_id"), run_id)
     release_named_lock("project", meta.get("project_lock"), run_id)
     update_meta(run_id, state="exited" if normal else "crashed", ended_at=time.time())
@@ -857,7 +1276,7 @@ def cleanup_run(run_id, normal):
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def watchdog_main(run_id, rows):
+def watchdog_main(run_id, display_mode):
     directory = run_dir(run_id)
     meta = get_meta(run_id)
     update_meta(
@@ -877,6 +1296,7 @@ def watchdog_main(run_id, rows):
     server.settimeout(0.25)
     (directory / "ready").touch(mode=0o600, exist_ok=True)
     binding = bool(meta.get("cancel_binding"))
+    skip_key = tmux_skip_key(binding, meta.get("tmux_session"))
     retry_count = 0
     retry_updated_at = time.time()
     pending = None
@@ -888,6 +1308,8 @@ def watchdog_main(run_id, rows):
     current_state = "ready"
     write_status(run_id, "ready", retry_count=0)
     last_render = 0.0
+    loaded_fingerprint = script_fingerprint()
+    next_update_check = time.monotonic() + UPDATE_CHECK_INTERVAL
     pane_dead_since = None
 
     def handle(event, deferred=False):
@@ -913,6 +1335,8 @@ def watchdog_main(run_id, rows):
             log_event(run_id, kind)
             return
         if kind == "turn_success":
+            completed_recovery = current_state == "awaiting" and retry_count > 0
+            completed_count = retry_count
             retry_count = 0
             retry_updated_at = time.time()
             pending = None
@@ -920,9 +1344,26 @@ def watchdog_main(run_id, rows):
             deferred_failures = []
             recovery_suppressed = False
             clear_expected_recovery(run_id)
-            current_state = "ready"
+            current_state = "completed" if completed_recovery else "ready"
             log_event(run_id, kind)
-            write_status(run_id, current_state, retry_count=0)
+            write_status(
+                run_id,
+                current_state,
+                retry_count=completed_count if completed_recovery else 0,
+                feedback_until=time.time() + RESULT_FEEDBACK_SECONDS if completed_recovery else None,
+            )
+            return
+        if kind == "unsupported_failure":
+            if event.get("subagent"):
+                log_event(run_id, "subagent_failure_observed", category="unsupported")
+                return
+            pending = None
+            submission = None
+            deferred_failures = []
+            clear_expected_recovery(run_id)
+            current_state = "unsupported"
+            log_event(run_id, kind)
+            write_status(run_id, current_state, retry_count=retry_count)
             return
         if kind == "prompt_submit":
             if event.get("recovery"):
@@ -930,9 +1371,10 @@ def watchdog_main(run_id, rows):
                 log_event(run_id, "recovery_prompt_submitted", retry_count=retry_count)
                 if current_state in {"submitting", "unconfirmed"}:
                     current_state = "awaiting"
-                    write_status(run_id, current_state, retry_count=retry_count)
                     if deferred_failures:
                         handle(deferred_failures.pop(0), deferred=True)
+                    else:
+                        write_status(run_id, current_state, retry_count=retry_count)
             else:
                 retry_count = 0
                 retry_updated_at = time.time()
@@ -1019,22 +1461,32 @@ def watchdog_main(run_id, rows):
                     break
             else:
                 pane_dead_since = None
-            if consume_cancel(run_id):
-                if pending or submission or deferred_failures:
-                    log_event(run_id, "recovery_cancelled", retry_count=retry_count)
-                recovery_suppressed = (
-                    recovery_suppressed
-                    or bool(submission)
-                    or current_state in {"unconfirmed", "awaiting"}
-                )
+            cancel_requested = (directory / "cancel").exists()
+            if cancel_requested and current_state == "countdown" and pending:
+                consume_cancel(run_id)
+                log_event(run_id, "recovery_skipped", retry_count=retry_count)
                 pending = None
+                deferred_failures = []
+                clear_expected_recovery(run_id)
+                current_state = "skipped"
+                write_status(
+                    run_id,
+                    current_state,
+                    retry_count=retry_count,
+                    feedback_until=time.time() + RESULT_FEEDBACK_SECONDS,
+                )
+            elif cancel_requested and submission:
+                consume_cancel(run_id)
+                log_event(run_id, "client_interrupt_cancelled_recovery")
                 submission = None
                 deferred_failures = []
                 clear_expected_recovery(run_id)
+                recovery_suppressed = True
                 current_state = "cancelled"
                 write_status(run_id, current_state, retry_count=retry_count)
             paused_now = is_paused(run_id)
-            if paused_now and current_state != "paused":
+            paused_state = "paused_global" if GLOBAL_PAUSE.exists() else "paused"
+            if paused_now and current_state not in {"paused", "paused_global"}:
                 if pending or submission or deferred_failures:
                     log_event(run_id, "recovery_paused", retry_count=retry_count)
                 recovery_suppressed = (
@@ -1046,13 +1498,33 @@ def watchdog_main(run_id, rows):
                 submission = None
                 deferred_failures = []
                 clear_expected_recovery(run_id)
-                current_state = "paused"
+                current_state = paused_state
                 write_status(run_id, current_state, retry_count=retry_count)
-            elif current_state == "paused" and not paused_now:
+            elif paused_now and current_state != paused_state:
+                current_state = paused_state
+                write_status(run_id, current_state, retry_count=retry_count)
+            elif current_state in {"paused", "paused_global"} and not paused_now:
                 retry_count = 0
                 retry_updated_at = time.time()
                 current_state = "ready"
                 write_status(run_id, current_state, retry_count=0)
+            if current_state in {"completed", "skipped"}:
+                status = read_json(directory / "status.json", {})
+                if time.time() >= float(status.get("feedback_until") or 0):
+                    current_state = "ready"
+                    write_status(run_id, current_state, retry_count=0)
+            now = time.monotonic()
+            if current_state in {"ready", "update_available"} and now >= next_update_check:
+                current_fingerprint = script_fingerprint()
+                next_update_check = now + UPDATE_CHECK_INTERVAL
+                if (
+                    loaded_fingerprint
+                    and current_fingerprint
+                    and current_fingerprint != loaded_fingerprint
+                    and current_state != "update_available"
+                ):
+                    current_state = "update_available"
+                    write_status(run_id, current_state, retry_count=0)
             if pending and time.time() - pending["created_at"] > EVENT_MAX_AGE:
                 pending = None
                 current_state = "stale"
@@ -1060,7 +1532,36 @@ def watchdog_main(run_id, rows):
                 write_status(run_id, current_state, retry_count=retry_count)
             if pending and time.monotonic() >= pending["deadline"]:
                 message = recovery_message(pending["number"], pending["category"])
-                submitted_at = inject_recovery(meta, message, run_id)
+                with recovery_control_lock(run_id):
+                    if (directory / "cancel").exists():
+                        consume_cancel(run_id)
+                        submitted_at = False
+                        current_state = "skipped"
+                        log_event(run_id, "recovery_skipped", retry_count=retry_count)
+                        write_status(
+                            run_id,
+                            current_state,
+                            retry_count=retry_count,
+                            feedback_until=time.time() + RESULT_FEEDBACK_SECONDS,
+                        )
+                    elif is_paused(run_id):
+                        submitted_at = False
+                        current_state = (
+                            "paused_global" if GLOBAL_PAUSE.exists() else "paused"
+                        )
+                        log_event(run_id, "recovery_paused", retry_count=retry_count)
+                        write_status(run_id, current_state, retry_count=retry_count)
+                    else:
+                        current_state = "submitting"
+                        write_status(
+                            run_id,
+                            current_state,
+                            retry_count=retry_count,
+                            phase="initial_wait",
+                            sent_attempts=0,
+                            failed_attempts=0,
+                        )
+                        submitted_at = inject_recovery(meta, message, run_id)
                 if submitted_at is not False:
                     log_event(
                         run_id,
@@ -1083,7 +1584,6 @@ def watchdog_main(run_id, rows):
                         "sent_attempts": 1,
                         "failed_attempts": 0,
                     }
-                    current_state = "submitting"
                     write_status(
                         run_id,
                         current_state,
@@ -1092,7 +1592,7 @@ def watchdog_main(run_id, rows):
                         sent_attempts=1,
                         failed_attempts=0,
                     )
-                else:
+                elif current_state == "submitting":
                     log_event(run_id, "recovery_injection_failed", retry_count=pending["number"])
                     current_state = "stale"
                     write_status(run_id, current_state, retry_count=retry_count)
@@ -1113,6 +1613,8 @@ def watchdog_main(run_id, rows):
                     submission["phase"] = "target_lost"
                     submission["final_done"] = True
                 elif result in {"paused", "cancelled"}:
+                    if result == "cancelled":
+                        consume_cancel(run_id)
                     submission = None
                     current_state = result
                 log_event(
@@ -1151,6 +1653,8 @@ def watchdog_main(run_id, rows):
                 elif result == "target_lost":
                     submission["phase"] = "target_lost"
                 elif result in {"paused", "cancelled"}:
+                    if result == "cancelled":
+                        consume_cancel(run_id)
                     submission = None
                     current_state = result
                 else:
@@ -1204,6 +1708,7 @@ def watchdog_main(run_id, rows):
                         pending["category"],
                         pending["deadline"] - now,
                         binding,
+                        skip_key=skip_key,
                     )
                 elif current_state == "submitting" and submission:
                     if submission["phase"] in {"initial_wait", "quick_retry_sent", "quick_retry_failed"}:
@@ -1234,7 +1739,7 @@ def watchdog_main(run_id, rows):
                     )
                 else:
                     text = status_text(current_state, meta, retry_count, binding=binding)
-                render_watchdog_status(text, rows, meta)
+                render_watchdog_status(current_state, text, display_mode, meta)
                 last_render = now
     finally:
         server.close()
@@ -1432,6 +1937,36 @@ def ensure_cancel_binding():
     return False
 
 
+def launch_watchdog(run_id, display_mode, main_pane, cwd):
+    if display_mode == "pane":
+        watchdog_command = shlex.join(
+            [str(PYTHON), str(SCRIPT), "watchdog", run_id, display_mode]
+        )
+        watchdog_pane = tmux_run(
+            [
+                "split-window", "-d", "-v", "-l", "1", "-P", "-F",
+                "#{pane_id}", "-t", main_pane, "-c", cwd, watchdog_command,
+            ],
+            check=True,
+        ).stdout.strip()
+        update_meta(run_id, watchdog_pane=watchdog_pane)
+        return watchdog_pane
+    watchdog = subprocess.Popen(
+        [str(PYTHON), str(SCRIPT), "watchdog", run_id, display_mode],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    update_meta(
+        run_id,
+        watchdog_pid=watchdog.pid,
+        watchdog_identity=process_identity(watchdog.pid),
+        watchdog_pane=None,
+    )
+    return None
+
+
 def attach_managed_session(run_id, tmux_session):
     try:
         return tmux_run(
@@ -1440,8 +1975,14 @@ def attach_managed_session(run_id, tmux_session):
             timeout=7 * 24 * 60 * 60,
         ).returncode
     except KeyboardInterrupt:
-        (run_dir(run_id) / "cancel").touch(mode=0o600, exist_ok=True)
-        log_event(run_id, "client_interrupt_cancelled_recovery")
+        directory = run_dir(run_id)
+        state = read_json(directory / "status.json", {}).get("state")
+        if state in {"countdown", "submitting", "unconfirmed"}:
+            with recovery_control_lock(run_id):
+                state = read_json(directory / "status.json", {}).get("state")
+                if state in {"countdown", "submitting", "unconfirmed"}:
+                    (directory / "cancel").touch(mode=0o600, exist_ok=True)
+                    log_event(run_id, "client_interrupt_requested_recovery_cancel")
         return 130
 
 
@@ -1488,7 +2029,6 @@ def interactive_main(args, lifecycle=None):
     atomic_json(directory / "meta.json", meta)
     lifecycle.close()
     columns, lines = shutil.get_terminal_size((100, 24))
-    rows = 2 if lines >= 16 else 0
     inside_tmux = bool(os.environ.get("TMUX"))
     created_tmux_session = None
     created_window = None
@@ -1526,28 +2066,9 @@ def interactive_main(args, lifecycle=None):
             tmux_identity=tmux_target_identity(main_pane),
             cancel_binding=binding,
         )
-        if rows:
-            watchdog_command = shlex.join([str(PYTHON), str(SCRIPT), "watchdog", run_id, str(rows)])
-            watchdog_pane = tmux_run(
-                ["split-window", "-d", "-v", "-l", str(rows), "-P", "-F", "#{pane_id}",
-                 "-t", main_pane, "-c", cwd, watchdog_command],
-                check=True,
-            ).stdout.strip()
-            update_meta(run_id, watchdog_pane=watchdog_pane)
-        else:
-            watchdog = subprocess.Popen(
-                [str(PYTHON), str(SCRIPT), "watchdog", run_id, "0"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            update_meta(
-                run_id,
-                watchdog_pid=watchdog.pid,
-                watchdog_identity=process_identity(watchdog.pid),
-                watchdog_pane=None,
-            )
+        display_mode = prepare_watchdog_display(run_id, lines)
+        update_meta(run_id, watchdog_display=display_mode)
+        launch_watchdog(run_id, display_mode, main_pane, cwd)
         tmux_run(["select-pane", "-t", main_pane], capture=True)
         if not launch_done.wait(timeout=15):
             raise TimeoutError("launch specification was not consumed")
@@ -1929,9 +2450,27 @@ def headless_main(args, lifecycle=None):
                 final_code = code
                 break
             deadline = time.monotonic() + delay
+            write_status(
+                run_id,
+                "countdown",
+                retry_count=recovery_count,
+                category=category,
+                delay=delay,
+            )
             cancelled = False
             while time.monotonic() < deadline:
-                if is_paused(run_id) or consume_cancel(run_id):
+                with recovery_control_lock(run_id):
+                    paused = is_paused(run_id)
+                    skipped = (directory / "cancel").exists()
+                    if skipped:
+                        consume_cancel(run_id)
+                if paused or skipped:
+                    if skipped:
+                        log_event(
+                            run_id,
+                            "recovery_skipped",
+                            retry_count=recovery_count,
+                        )
                     if not stream:
                         emit_store(stdout_store, sys.stdout.buffer)
                         emit_store(stderr_store, sys.stderr.buffer)
@@ -1940,6 +2479,29 @@ def headless_main(args, lifecycle=None):
                     break
                 time.sleep(min(0.25, deadline - time.monotonic()))
             if cancelled:
+                break
+            with recovery_control_lock(run_id):
+                paused = is_paused(run_id)
+                skipped = (directory / "cancel").exists()
+                if skipped:
+                    consume_cancel(run_id)
+                if not paused and not skipped:
+                    write_status(
+                        run_id,
+                        "submitting",
+                        retry_count=recovery_count,
+                    )
+            if paused or skipped:
+                if skipped:
+                    log_event(
+                        run_id,
+                        "recovery_skipped",
+                        retry_count=recovery_count,
+                    )
+                if not stream:
+                    emit_store(stdout_store, sys.stdout.buffer)
+                    emit_store(stderr_store, sys.stderr.buffer)
+                final_code = code
                 break
             if stdout_store:
                 stdout_store.close()
@@ -2064,22 +2626,103 @@ def find_run(name):
     raise SystemExit("claude-auto: multiple sessions match {!r}".format(name))
 
 
-def list_runs():
-    cleanup_stale()
-    rows = []
-    for path in RUNS_DIR.iterdir():
+SESSION_STATE_GROUPS = {
+    "error": {
+        "unconfirmed", "stale", "exhausted", "unsupported", "blocked",
+        "incompatible", "target_lost", "crashed",
+    },
+    "active": {"countdown", "submitting", "awaiting"},
+    "update": {"update_available"},
+    "paused": {"paused", "paused_global"},
+}
+SESSION_RISK = {"error": 0, "active": 1, "update": 2, "paused": 3, "ok": 4}
+SESSION_TAGS = {
+    "error": "ERROR",
+    "active": "ACTIVE",
+    "update": "UPDATE",
+    "paused": "PAUSED",
+    "ok": "OK",
+}
+
+
+CLI_SEVERITY_STYLE = {
+    "error": ("!", "31"),
+    "active": ("◔", "36"),
+    "update": ("!", "33"),
+    "paused": ("○", "2"),
+    "ok": ("✓", "32"),
+}
+
+
+def cli_severity_tag(severity, stream=None):
+    stream = stream or sys.stdout
+    label = SESSION_TAGS[severity]
+    color, unicode = terminal_capabilities(stream)
+    if not color:
+        return label
+    symbol, code = CLI_SEVERITY_STYLE[severity]
+    if not unicode:
+        symbol = {"error": "!", "active": "~", "update": "!", "paused": "-", "ok": "+"}[severity]
+    return "\033[{}m{} {}\033[0m".format(code, symbol, label)
+
+
+def session_severity(state):
+    for severity, states in SESSION_STATE_GROUPS.items():
+        if state in states:
+            return severity
+    return "ok"
+
+
+def session_diagnostics():
+    diagnostics = []
+    for path in RUNS_DIR.iterdir() if RUNS_DIR.exists() else []:
         if not path.is_dir():
             continue
         meta = read_json(path / "meta.json", {})
         if not run_is_live(path.name, meta):
             continue
-        status = read_json(path / "status.json", {}).get("state", meta.get("status", "running"))
-        rows.append((meta.get("name", path.name), meta.get("mode", "?"), status, meta.get("cwd", "")))
+        status = read_json(path / "status.json", {})
+        state = status.get("state", meta.get("status", "running"))
+        if (
+            meta.get("version")
+            and meta.get("version") != VERSION
+            and session_severity(state) not in {"error", "active"}
+        ):
+            state = "update_available"
+        severity = session_severity(state)
+        diagnostics.append(
+            {
+                "run_id": path.name,
+                "name": meta.get("name", path.name),
+                "mode": meta.get("mode", "?"),
+                "cwd": meta.get("cwd", ""),
+                "state": state,
+                "severity": severity,
+                "version": meta.get("version"),
+            }
+        )
+    diagnostics.sort(
+        key=lambda item: (SESSION_RISK[item["severity"]], item["name"])
+    )
+    return diagnostics
+
+
+def list_runs():
+    cleanup_stale()
+    rows = session_diagnostics()
     if not rows:
         print("No active claude-auto sessions.")
         return 0
-    for name, mode, status, cwd in sorted(rows):
-        print("{:<36} {:<12} {:<12} {}".format(name, mode, status, cwd))
+    for row in rows:
+        print(
+            "{:<7} {:<36} {:<12} {:<18} {}".format(
+                cli_severity_tag(row["severity"]),
+                row["name"],
+                row["mode"],
+                row["state"],
+                row["cwd"],
+            )
+        )
     return 0
 
 
@@ -2116,35 +2759,55 @@ def set_pause(name, paused):
     if name:
         run_id, _ = find_run(name)
         marker = run_dir(run_id) / "paused"
+        lock = recovery_control_lock(run_id)
     else:
         marker = GLOBAL_PAUSE
-    if paused:
-        atomic_json(marker, {"paused_at": time.time(), "scope": name or "global"})
-        if name:
-            (run_dir(run_id) / "cancel").touch(mode=0o600, exist_ok=True)
-    else:
-        try:
-            marker.unlink()
-        except FileNotFoundError:
-            pass
-        if name:
-            write_status(run_id, "ready", retry_count=0)
+        lock = recovery_control_lock(global_exclusive=True)
+    with lock:
+        if paused:
+            atomic_json(marker, {"paused_at": time.time(), "scope": name or "global"})
+        else:
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            if name:
+                write_status(run_id, "ready", retry_count=0)
     print("{} {} recovery.".format("Paused" if paused else "Resumed", name or "global"))
     return 0
 
 
-def cancel_run(name):
+def skip_run(name):
     run_id, meta = find_run(name)
-    (run_dir(run_id) / "cancel").touch(mode=0o600, exist_ok=True)
-    print("Cancelled pending recovery for {}.".format(meta.get("name", name)))
+    with recovery_control_lock(run_id):
+        state = read_json(run_dir(run_id) / "status.json", {}).get("state")
+        if state != "countdown":
+            if state in {"submitting", "awaiting"}:
+                print(
+                    "Recovery is already submitting; it cannot be safely skipped.",
+                    file=sys.stderr,
+                )
+            else:
+                print("No pending recovery to skip for {}.".format(meta.get("name", name)), file=sys.stderr)
+            return 1
+        (run_dir(run_id) / "cancel").touch(mode=0o600, exist_ok=True)
+    print("Skipped pending recovery for {}.".format(meta.get("name", name)))
     return 0
+
+
+def cancel_run(name):
+    return skip_run(name)
 
 
 def cancel_target(session_name, window_id):
     for path in RUNS_DIR.iterdir() if RUNS_DIR.exists() else []:
         meta = read_json(path / "meta.json", {})
         if meta.get("tmux_session") == session_name and meta.get("window_id") == window_id:
-            (path / "cancel").touch(mode=0o600, exist_ok=True)
+            with recovery_control_lock(path.name):
+                status = read_json(path / "status.json", {})
+                if status.get("state") != "countdown":
+                    return 1
+                (path / "cancel").touch(mode=0o600, exist_ok=True)
             return 0
     return 1
 
@@ -2160,6 +2823,26 @@ def show_logs(name):
     return 0
 
 
+SESSION_ACTIONS = {
+    "unconfirmed": "inspect the session; press Enter only if recovery text remains",
+    "stale": "inspect the session, then run claude-auto doctor",
+    "exhausted": "inspect the session before continuing manually",
+    "unsupported": "inspect the session before continuing manually",
+    "blocked": "run claude-auto doctor",
+    "incompatible": "run claude-auto doctor",
+    "target_lost": "run claude-auto doctor",
+    "update_available": "restart this managed session to load the installed update",
+}
+
+
+def session_action(row):
+    if row["state"] == "paused_global":
+        return "run claude-auto resume"
+    if row["state"] == "paused":
+        return "run claude-auto resume {}".format(row["name"])
+    return SESSION_ACTIONS.get(row["state"], "inspect this managed session")
+
+
 def doctor():
     cleanup_stale()
     compatible, version, changed, errors = compatibility_check(update_version=True)
@@ -2172,7 +2855,77 @@ def doctor():
         print("Claude Code version changed; local compatibility check was run.")
     for error in errors:
         print("- {}".format(error))
-    return 0 if compatible else 1
+    diagnostics = session_diagnostics()
+    if diagnostics:
+        print("managed sessions:")
+        for row in diagnostics:
+            print(
+                "{} {} · {} · cwd={}".format(
+                    cli_severity_tag(row["severity"]),
+                    row["name"],
+                    row["state"],
+                    row["cwd"],
+                )
+            )
+            if row["severity"] != "ok":
+                print("  action: {}".format(session_action(row)))
+    has_session_error = any(row["severity"] == "error" for row in diagnostics)
+    return 0 if compatible and not has_session_error else 1
+
+
+RESUME_SESSION_ID = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+    r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+)
+
+
+def install_report_active():
+    live = []
+    try:
+        paths = list(RUNS_DIR.iterdir()) if RUNS_DIR.exists() else []
+    except OSError:
+        paths = []
+    for path in paths:
+        if not path.is_dir() or not re.fullmatch(r"[0-9a-f]{32}", path.name):
+            continue
+        meta = read_json(path / "meta.json", {})
+        try:
+            if run_is_live(path.name, meta):
+                live.append(meta)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    if not live:
+        return 0
+    count = len(live)
+    noun = "session" if count == 1 else "sessions"
+    verb = "is" if count == 1 else "are"
+    print(
+        "claude-auto: {} managed {} started before this installation {} still active.".format(
+            count, noun, verb
+        )
+    )
+    print(
+        "Their already-running recovery process was not replaced; no session was stopped or changed."
+        if count != 1
+        else "Its already-running recovery process was not replaced; no session was stopped or changed."
+    )
+    for meta in live:
+        mode = json.dumps(str(meta.get("mode") or "unknown"), ensure_ascii=True)
+        cwd = json.dumps(str(meta.get("cwd") or "unknown"), ensure_ascii=True)
+        session_id = meta.get("session_id")
+        encoded_session = json.dumps(
+            str(session_id) if session_id else "unavailable", ensure_ascii=True
+        )
+        print("  mode={} cwd={} session_id={}".format(mode, cwd, encoded_session))
+        if session_id and RESUME_SESSION_ID.fullmatch(str(session_id)):
+            print("  After it exits, start Claude from the reported cwd and use:")
+            print("    claude --resume {}".format(session_id))
+        else:
+            print("  After it exits, use Claude Code's normal resume selection from the reported cwd.")
+    print(
+        "  Resume restores conversation history, not the original CLI invocation; reapply any launch policy or configuration options you still need."
+    )
+    return 0
 
 
 def self_test():
@@ -2435,6 +3188,8 @@ def management_main(args, lifecycle=None):
     pause.add_argument("name", nargs="?")
     resume = subparsers.add_parser("resume")
     resume.add_argument("name", nargs="?")
+    skip = subparsers.add_parser("skip")
+    skip.add_argument("name")
     cancel = subparsers.add_parser("cancel")
     cancel.add_argument("name")
     logs = subparsers.add_parser("logs")
@@ -2459,8 +3214,8 @@ def management_main(args, lifecycle=None):
         return set_pause(ns.name, True)
     if ns.command == "resume":
         return set_pause(ns.name, False)
-    if ns.command == "cancel":
-        return cancel_run(ns.name)
+    if ns.command in {"skip", "cancel"}:
+        return skip_run(ns.name)
     if ns.command == "logs":
         return show_logs(ns.name)
     if ns.command == "doctor":
@@ -2520,11 +3275,13 @@ def main():
         finally:
             lifecycle.close()
     if len(sys.argv) >= 4 and sys.argv[1] == "watchdog":
-        return watchdog_main(sys.argv[2], int(sys.argv[3]))
+        return watchdog_main(sys.argv[2], sys.argv[3])
     if len(sys.argv) >= 3 and sys.argv[1] == "pane-run":
         return pane_run_main(sys.argv[2])
     if len(sys.argv) >= 4 and sys.argv[1] == "cancel-target":
         return cancel_target(sys.argv[2], sys.argv[3])
+    if len(sys.argv) >= 2 and sys.argv[1] == "install-report-active":
+        return install_report_active()
     if len(sys.argv) >= 2 and sys.argv[1] == "install-self-test":
         return self_test()
     if len(sys.argv) >= 2 and sys.argv[1] == "manage":

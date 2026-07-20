@@ -66,7 +66,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.module.atomic_json(directory / "meta.json", value)
         return directory
 
-    def test_submission_status_reports_retry_phase_and_rounded_deadline(self):
+    def test_submission_status_hides_internal_enter_retry_phases(self):
         countdown = self.module.status_text(
             "countdown",
             {"name": "demo"},
@@ -86,9 +86,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             phase="initial_wait",
             sent_attempts=1,
         )
-        self.assertIn("quick retry pending", initial)
-        self.assertIn("final retry in 5s", initial)
-        self.assertNotIn("取消", initial)
+        self.assertEqual(initial, "Submitting recovery 1/3")
+        self.assertNotIn("retry", initial.casefold())
 
         failed = self.module.status_text(
             "unconfirmed",
@@ -97,8 +96,965 @@ class RuntimeSafetyTests(unittest.TestCase):
             sent_attempts=2,
             failed_attempts=1,
         )
-        self.assertIn("2 Enter sent/1 failed", failed)
-        self.assertIn("press Enter if text remains", failed)
+        self.assertEqual(
+            failed,
+            "Submit not confirmed · press Enter if recovery remains",
+        )
+        self.assertNotIn("2 Enter", failed)
+
+    def test_status_text_uses_single_line_user_facing_states(self):
+        cases = [
+            (
+                self.module.status_text("ready", {"name": "demo"}),
+                "Recovery ready · v1.0.2",
+            ),
+            (
+                self.module.status_text(
+                    "countdown",
+                    {"name": "demo"},
+                    retry_count=1,
+                    category="overloaded",
+                    remaining=13.01,
+                    binding=True,
+                    skip_key="C-a X",
+                ),
+                "Service overloaded · recovery 1/3 in 14s · C-a X skip",
+            ),
+            (
+                self.module.status_text(
+                    "submitting", {"name": "demo"}, retry_count=1
+                ),
+                "Submitting recovery 1/3",
+            ),
+            (
+                self.module.status_text(
+                    "awaiting", {"name": "demo"}, retry_count=1
+                ),
+                "Recovery 1/3 active",
+            ),
+            (
+                self.module.status_text(
+                    "completed", {"name": "demo"}, retry_count=1
+                ),
+                "Recovery 1/3 complete",
+            ),
+            (
+                self.module.status_text("skipped", {"name": "demo"}),
+                "Recovery skipped",
+            ),
+            (
+                self.module.status_text("cancelled", {"name": "demo"}),
+                "Submit retries stopped",
+            ),
+            (
+                self.module.status_text(
+                    "unconfirmed", {"name": "demo"}, retry_count=1
+                ),
+                "Submit not confirmed · press Enter if recovery remains",
+            ),
+            (
+                self.module.status_text("exhausted", {"name": "demo"}),
+                "Recovery stopped after 3 attempts · inspect session",
+            ),
+            (
+                self.module.status_text("unsupported", {"name": "demo"}),
+                "Recovery stopped · inspect session",
+            ),
+        ]
+        for actual, expected in cases:
+            self.assertEqual(actual, expected)
+            self.assertNotIn("\n", actual)
+
+    def test_status_presentation_adapts_style_and_width(self):
+        rich = self.module.present_status(
+            "countdown",
+            "Service overloaded · recovery 1/3 in 14s · C-b X skip",
+            width=80,
+            color=True,
+            unicode=True,
+        )
+        self.assertEqual(
+            rich,
+            "#[fg=cyan]◔#[default] Service overloaded · recovery 1/3 in 14s · C-b X skip",
+        )
+        compact = self.module.present_status(
+            "countdown",
+            "Service overloaded · recovery 1/3 in 14s · C-b X skip",
+            width=43,
+            color=False,
+            unicode=True,
+        )
+        self.assertEqual(compact, "◔ Service overloaded · recovery 1/3 in 14s")
+        shortest = self.module.present_status(
+            "countdown",
+            "Service overloaded · recovery 1/3 in 14s · C-b X skip",
+            width=22,
+            color=False,
+            unicode=False,
+        )
+        self.assertEqual(shortest, "[~] Recovery 1/3 14s")
+        self.assertEqual(
+            self.module.present_status(
+                "ready", "Recovery ready · v1.0.2", width=80, color=False, unicode=False
+            ),
+            "[o] Recovery ready | v1.0.2",
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "paused", "Recovery paused", width=80, color=True, unicode=True
+            ),
+            "#[dim]○#[default] Recovery paused",
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "update_available",
+                "Update installed · restart to update",
+                width=80,
+                color=True,
+                unicode=True,
+            ),
+            "#[fg=yellow]!#[default] Update installed · restart to update",
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "unsupported", "Recovery stopped · inspect session", width=80, color=True, unicode=True
+            ),
+            "#[fg=red]!#[default] Recovery stopped · inspect session",
+        )
+
+    def test_default_tmux_display_uses_bottom_border_on_main_pane(self):
+        run_id = "2" * 32
+        self.create_run(run_id, window_id="@7", main_pane="%42")
+        calls = []
+
+        def tmux_run(arguments, **_):
+            calls.append(arguments)
+            if arguments[-1] == "pane-border-status" and "-A" in arguments:
+                return Result(stdout="off\n")
+            if arguments[-1] == "pane-border-format" and "-A" in arguments:
+                return Result(stdout="#{pane_index} #{pane_title}\n")
+            return Result()
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=tmux_run):
+            mode = self.module.prepare_watchdog_display(run_id, lines=24)
+
+        self.assertEqual(mode, "border")
+        self.assertIn(
+            ["set-option", "-w", "-t", "@7", "pane-border-status", "bottom"],
+            calls,
+        )
+        format_calls = [
+            call
+            for call in calls
+            if call[:5] == ["set-option", "-w", "-t", "@7", "pane-border-format"]
+        ]
+        self.assertEqual(len(format_calls), 1)
+        self.assertEqual(
+            format_calls[0][-1],
+            "#{?@claude_auto_watchdog_main, #{@claude_auto_watchdog_status} ,}",
+        )
+        self.assertNotIn("pane_active", format_calls[0][-1])
+        self.assertIn(
+            [
+                "set-option", "-p", "-t", "%42",
+                "@claude_auto_watchdog_main", "1",
+            ],
+            calls,
+        )
+        status_calls = [
+            call
+            for call in calls
+            if call[:5] == [
+                "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status"
+            ]
+        ]
+        self.assertEqual(
+            status_calls[-1][-1],
+            "#[fg=cyan]◔#[default] Starting auto-recovery…",
+        )
+        saved = self.module.get_meta(run_id)["tmux_border_snapshot"]
+        self.assertFalse(saved["pane-border-status"]["local"])
+        self.assertFalse(saved["pane-border-format"]["local"])
+
+    def test_border_renderer_only_updates_namespaced_status(self):
+        calls = []
+        meta = {"window_id": "@7", "main_pane": "%42"}
+        with mock.patch.object(
+            self.module,
+            "tmux_run",
+            side_effect=lambda arguments, **_: calls.append(arguments) or Result(),
+        ):
+            self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.2", "border", meta
+            )
+
+        self.assertEqual(
+            calls,
+            [[
+                "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.2",
+            ]],
+        )
+
+    def test_tmux_display_preserves_custom_border_and_hides_on_short_terminal(self):
+        custom_run = "3" * 32
+        self.create_run(custom_run, window_id="@8", main_pane="%43")
+        custom_calls = []
+
+        def custom_tmux(arguments, **_):
+            custom_calls.append(arguments)
+            if arguments[-1] == "pane-border-status":
+                return Result(stdout="top\n")
+            return Result(stdout="#{pane_index} #{pane_title}\n")
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=custom_tmux):
+            self.assertEqual(
+                self.module.prepare_watchdog_display(custom_run, lines=24), "pane"
+            )
+        self.assertFalse(any(call[0] == "set-option" for call in custom_calls))
+
+        short_run = "4" * 32
+        self.create_run(short_run, window_id="@9", main_pane="%44")
+        with mock.patch.object(self.module, "tmux_run") as tmux:
+            self.assertEqual(
+                self.module.prepare_watchdog_display(short_run, lines=15), "hidden"
+            )
+        tmux.assert_not_called()
+
+    def test_tmux_border_restore_preserves_local_and_inherited_options(self):
+        run_id = "5" * 32
+        self.create_run(run_id, window_id="@10", main_pane="%45")
+        calls = []
+
+        restoring = {"value": False}
+        managed = {}
+
+        def tmux_run(arguments, **_):
+            calls.append(arguments)
+            if "-A" in arguments:
+                if arguments[-1] == "pane-border-status":
+                    return Result(stdout="off\n")
+                return Result(stdout="#{pane_index} #{pane_title}\n")
+            if arguments[0] == "show-options":
+                name = arguments[-1]
+                if restoring["value"]:
+                    value = managed[name]
+                    if "-v" in arguments:
+                        return Result(stdout=value + "\n")
+                    return Result(stdout=name + " " + value + "\n")
+                if "-p" in arguments:
+                    return Result(stdout="")
+                if "-v" in arguments:
+                    raw = {
+                        "pane-border-status": "off\n",
+                        "@claude_auto_watchdog_status": "existing status\n",
+                    }
+                    return Result(stdout=raw[name])
+                formatted = {
+                    "pane-border-status": "pane-border-status off\n",
+                    "pane-border-format": "",
+                    "@claude_auto_watchdog_status": (
+                        '@claude_auto_watchdog_status "existing status"\n'
+                    ),
+                }
+                return Result(stdout=formatted[name])
+            return Result()
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=tmux_run):
+            self.assertEqual(
+                self.module.prepare_watchdog_display(run_id, lines=24), "border"
+            )
+            meta = self.module.get_meta(run_id)
+            managed.update(meta["tmux_border_owned"])
+            managed[self.module.TMUX_MAIN_PANE_OPTION] = meta[
+                "tmux_main_pane_owned"
+            ]
+            restoring["value"] = True
+            calls.clear()
+            self.module.restore_watchdog_border(meta)
+
+        mutations = [call for call in calls if call[0] == "set-option"]
+        self.assertEqual(
+            mutations,
+            [
+                [
+                    "set-option", "-w", "-t", "@10",
+                    "pane-border-status", "off",
+                ],
+                [
+                    "set-option", "-u", "-w", "-t", "@10",
+                    "pane-border-format",
+                ],
+                [
+                    "set-option", "-w", "-t", "@10",
+                    "@claude_auto_watchdog_status", "existing status",
+                ],
+                [
+                    "set-option", "-u", "-p", "-t", "%45",
+                    "@claude_auto_watchdog_main",
+                ],
+            ],
+        )
+
+    def test_tmux_border_restore_preserves_runtime_user_changes(self):
+        run_id = "8" * 32
+        self.create_run(
+            run_id,
+            window_id="@12",
+            main_pane="%48",
+            tmux_border_snapshot={
+                "pane-border-status": {"local": False},
+                "pane-border-format": {"local": False},
+                "@claude_auto_watchdog_status": {"local": False},
+            },
+            tmux_border_owned={
+                "pane-border-status": "bottom",
+                "pane-border-format": (
+                    "#{?@claude_auto_watchdog_main, "
+                    "#{@claude_auto_watchdog_status} ,}"
+                ),
+                "@claude_auto_watchdog_status": "managed status",
+            },
+            tmux_main_pane_snapshot={"local": False},
+            tmux_main_pane_owned="1",
+        )
+        calls = []
+        current = {
+            "pane-border-status": "top",
+            "pane-border-format": "custom #{pane_index}",
+            "@claude_auto_watchdog_status": "managed status",
+            "@claude_auto_watchdog_main": "user marker",
+        }
+
+        def tmux_run(arguments, **_):
+            calls.append(arguments)
+            if arguments[0] != "show-options":
+                return Result()
+            name = arguments[-1]
+            if "-v" in arguments:
+                return Result(stdout=current[name] + "\n")
+            return Result(stdout=name + " " + current[name] + "\n")
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=tmux_run):
+            self.module.restore_watchdog_border(self.module.get_meta(run_id))
+
+        mutations = [call for call in calls if call[0] == "set-option"]
+        self.assertEqual(
+            mutations,
+            [[
+                "set-option", "-u", "-w", "-t", "@12",
+                "@claude_auto_watchdog_status",
+            ]],
+        )
+
+    def test_watchdog_launch_uses_one_line_only_for_compatibility_pane(self):
+        run_id = "6" * 32
+        calls = []
+        with mock.patch.object(
+            self.module,
+            "tmux_run",
+            side_effect=lambda arguments, **_: calls.append(arguments)
+            or Result(stdout="%46\n"),
+        ), mock.patch.object(self.module.subprocess, "Popen") as popen:
+            self.assertEqual(
+                self.module.launch_watchdog(
+                    run_id, "pane", "%45", str(self.home)
+                ),
+                "%46",
+            )
+        popen.assert_not_called()
+        split = calls[0]
+        self.assertEqual(split[:6], ["split-window", "-d", "-v", "-l", "1", "-P"])
+        self.assertIn(" pane", split[-1])
+
+        process = mock.Mock(pid=321)
+        with mock.patch.object(
+            self.module.subprocess, "Popen", return_value=process
+        ) as popen, mock.patch.object(
+            self.module, "process_identity", return_value="identity"
+        ):
+            self.assertIsNone(
+                self.module.launch_watchdog(
+                    run_id, "border", "%45", str(self.home)
+                )
+            )
+        self.assertEqual(popen.call_args.args[0][-1], "border")
+
+    def test_tmux_border_setup_failure_restores_before_fallback(self):
+        run_id = "7" * 32
+        self.create_run(run_id, window_id="@11", main_pane="%47")
+        calls = []
+        failed = {"value": False}
+        current = {}
+
+        def tmux_run(arguments, **_):
+            calls.append(arguments)
+            if "-A" in arguments:
+                if arguments[-1] == "pane-border-status":
+                    return Result(stdout="off\n")
+                return Result(stdout="#{pane_index} #{pane_title}\n")
+            if arguments[0] == "show-options":
+                scope = "pane" if "-p" in arguments else "window"
+                name = arguments[-1]
+                key = (scope, name)
+                if key not in current:
+                    return Result(stdout="")
+                if "-v" in arguments:
+                    return Result(stdout=current[key] + "\n")
+                return Result(stdout=name + " " + current[key] + "\n")
+            if (
+                arguments[:5]
+                == ["set-option", "-w", "-t", "@11", "pane-border-format"]
+                and not failed["value"]
+            ):
+                failed["value"] = True
+                return Result(returncode=1)
+            if arguments[0] == "set-option":
+                scope = "pane" if "-p" in arguments else "window"
+                name = arguments[-1] if "-u" in arguments else arguments[-2]
+                key = (scope, name)
+                if "-u" in arguments:
+                    current.pop(key, None)
+                else:
+                    current[key] = arguments[-1]
+            return Result()
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=tmux_run):
+            mode = self.module.prepare_watchdog_display(run_id, lines=24)
+
+        self.assertEqual(mode, "pane")
+        failure_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call[:5]
+            == ["set-option", "-w", "-t", "@11", "pane-border-format"]
+        )
+        restore_calls = [
+            call for call in calls[failure_index + 1:] if call[0] == "set-option"
+        ]
+        self.assertEqual(
+            restore_calls,
+            [
+                [
+                    "set-option", "-u", "-w", "-t", "@11",
+                    "@claude_auto_watchdog_status",
+                ],
+                [
+                    "set-option", "-u", "-p", "-t", "%47",
+                    "@claude_auto_watchdog_main",
+                ],
+            ],
+        )
+
+    def test_tmux_skip_key_uses_effective_prefix_only_when_bound(self):
+        calls = []
+        with mock.patch.object(
+            self.module,
+            "tmux_run",
+            side_effect=lambda arguments, **_: calls.append(arguments)
+            or Result(stdout="C-a\n"),
+        ):
+            self.assertEqual(
+                self.module.tmux_skip_key(True, "managed-session"), "C-a X"
+            )
+        self.assertEqual(
+            calls,
+            [["show-options", "-v", "-t", "managed-session", "prefix"]],
+        )
+        with mock.patch.object(
+            self.module,
+            "tmux_run",
+            return_value=Result(stdout="None\n"),
+        ):
+            self.assertIsNone(self.module.tmux_skip_key(True, "managed-session"))
+        with mock.patch.object(self.module, "tmux_run") as tmux:
+            self.assertIsNone(self.module.tmux_skip_key(False, "managed-session"))
+        tmux.assert_not_called()
+
+    def test_idle_watchdog_detects_installed_script_update(self):
+        run_id = "8" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%48",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        probes = {"count": 0}
+
+        def fingerprint():
+            probes["count"] += 1
+            return "old" if probes["count"] == 1 else "new"
+
+        with mock.patch.object(
+            self.module, "UPDATE_CHECK_INTERVAL", 0.05
+        ), mock.patch.object(
+            self.module, "script_fingerprint", side_effect=fingerprint
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "hidden"),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "update_available"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "update_available",
+            )
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+    def test_watchdog_distinguishes_global_and_session_pause(self):
+        run_id = "9" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%49",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        self.module.GLOBAL_PAUSE.touch(mode=0o600)
+        with mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "hidden"),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "paused_global"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "paused_global",
+            )
+            self.module.GLOBAL_PAUSE.unlink()
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "ready"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            (directory / "paused").touch(mode=0o600)
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "paused"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "paused",
+            )
+            alive["value"] = False
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
+    def test_terminal_capabilities_honor_no_color_dumb_and_encoding(self):
+        stream = mock.Mock()
+        stream.isatty.return_value = True
+        stream.encoding = "utf-8"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                self.module.terminal_capabilities(stream), (True, True)
+            )
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}, clear=True):
+            self.assertEqual(
+                self.module.terminal_capabilities(stream), (False, True)
+            )
+        with mock.patch.dict(os.environ, {"TERM": "dumb"}, clear=True):
+            self.assertEqual(
+                self.module.terminal_capabilities(stream), (False, True)
+            )
+        stream.encoding = "ascii"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                self.module.terminal_capabilities(stream), (True, False)
+            )
+
+    def test_list_sorts_sessions_by_risk_with_plain_pipe_output(self):
+        healthy = "a" * 32
+        broken = "b" * 32
+        active = "c" * 32
+        self.create_run(
+            healthy,
+            name="aaa-ready",
+            mode="interactive",
+            cwd="/healthy",
+            version=self.module.VERSION,
+        )
+        self.create_run(
+            broken,
+            name="zzz-broken",
+            mode="interactive",
+            cwd="/broken",
+            version=self.module.VERSION,
+        )
+        self.create_run(
+            active,
+            name="mmm-recovering",
+            mode="interactive",
+            cwd="/active",
+            version=self.module.VERSION,
+        )
+        self.module.atomic_json(
+            self.module.run_dir(healthy) / "status.json", {"state": "ready"}
+        )
+        self.module.atomic_json(
+            self.module.run_dir(broken) / "status.json", {"state": "unsupported"}
+        )
+        self.module.atomic_json(
+            self.module.run_dir(active) / "status.json",
+            {"state": "countdown", "retry_count": 1, "category": "timeout", "delay": 5},
+        )
+        output = io.StringIO()
+        with mock.patch.object(sys, "stdout", output):
+            self.assertEqual(self.module.list_runs(), 0)
+
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0].split()[0:2], ["ERROR", "zzz-broken"])
+        self.assertEqual(lines[1].split()[0:2], ["ACTIVE", "mmm-recovering"])
+        self.assertEqual(lines[2].split()[0:2], ["OK", "aaa-ready"])
+        self.assertNotIn("\x1b[", output.getvalue())
+
+    def test_doctor_reports_all_risky_sessions_with_safe_actions(self):
+        broken = "d" * 32
+        update = "e" * 32
+        paused = "f" * 32
+        for run_id, name, cwd in (
+            (broken, "broken", "/broken"),
+            (update, "old-code", "/old"),
+            (paused, "paused", "/paused"),
+        ):
+            self.create_run(
+                run_id,
+                name=name,
+                mode="interactive",
+                cwd=cwd,
+                version=self.module.VERSION,
+            )
+        self.module.atomic_json(
+            self.module.run_dir(broken) / "status.json", {"state": "target_lost"}
+        )
+        self.module.atomic_json(
+            self.module.run_dir(update) / "status.json",
+            {"state": "update_available"},
+        )
+        self.module.atomic_json(
+            self.module.run_dir(paused) / "status.json", {"state": "paused"}
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            self.module,
+            "compatibility_check",
+            return_value=(True, "2.0.0", False, []),
+        ), mock.patch.object(
+            self.module, "TMUX", Path("/bin/sh")
+        ), mock.patch.object(
+            self.module, "tmux_run", return_value=Result(stdout="tmux 3.5\n")
+        ), mock.patch.object(sys, "stdout", output):
+            self.assertEqual(self.module.doctor(), 1)
+
+        text = output.getvalue()
+        self.assertLess(text.index("ERROR broken"), text.index("UPDATE old-code"))
+        self.assertLess(text.index("UPDATE old-code"), text.index("PAUSED paused"))
+        self.assertIn("claude-auto doctor", text)
+        self.assertIn("restart this managed session", text)
+        self.assertIn("claude-auto resume paused", text)
+        self.assertIn("cwd=/broken", text)
+
+    def test_cli_severity_tag_styles_only_on_tty(self):
+        stream = mock.Mock()
+        stream.isatty.return_value = True
+        stream.encoding = "utf-8"
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                self.module.cli_severity_tag("error", stream),
+                "\x1b[31m! ERROR\x1b[0m",
+            )
+            self.assertEqual(
+                self.module.cli_severity_tag("ok", stream),
+                "\x1b[32m✓ OK\x1b[0m",
+            )
+        stream.isatty.return_value = False
+        self.assertEqual(self.module.cli_severity_tag("error", stream), "ERROR")
+
+    def test_session_diagnostics_promotes_old_ready_runtime_to_update(self):
+        old = "1" * 32
+        broken = "2" * 32
+        self.create_run(
+            old,
+            name="old-ready",
+            mode="interactive",
+            cwd="/old",
+            version="1.0.0",
+        )
+        self.create_run(
+            broken,
+            name="old-broken",
+            mode="interactive",
+            cwd="/broken",
+            version="1.0.0",
+        )
+        self.module.atomic_json(
+            self.module.run_dir(old) / "status.json", {"state": "ready"}
+        )
+        self.module.atomic_json(
+            self.module.run_dir(broken) / "status.json", {"state": "unsupported"}
+        )
+        paused = "3" * 32
+        self.create_run(
+            paused,
+            name="old-paused",
+            mode="interactive",
+            cwd="/paused",
+            version="1.0.0",
+        )
+        self.module.atomic_json(
+            self.module.run_dir(paused) / "status.json", {"state": "paused"}
+        )
+
+        diagnostics = self.module.session_diagnostics()
+        by_name = {row["name"]: row for row in diagnostics}
+        self.assertEqual(by_name["old-ready"]["state"], "update_available")
+        self.assertEqual(by_name["old-ready"]["severity"], "update")
+        self.assertEqual(by_name["old-broken"]["state"], "unsupported")
+        self.assertEqual(by_name["old-broken"]["severity"], "error")
+        self.assertEqual(by_name["old-paused"]["state"], "update_available")
+        self.assertEqual(by_name["old-paused"]["severity"], "update")
+
+    def test_install_report_lists_live_sessions_without_mutating_or_leaking_argv(self):
+        run_id = "3" * 32
+        directory = self.create_run(
+            run_id,
+            name="active",
+            mode="interactive",
+            cwd="/work/project\nunsafe",
+            session_id="00000000-0000-4000-8000-000000000000",
+            argv=["--settings", "secret-value"],
+        )
+        before = (directory / "meta.json").read_bytes()
+        output = io.StringIO()
+        with mock.patch.object(
+            self.module, "run_is_live", return_value=True
+        ), mock.patch.object(sys, "stdout", output):
+            self.assertEqual(self.module.install_report_active(), 0)
+
+        text = output.getvalue()
+        self.assertIn("1 managed session started before this installation is still active", text)
+        self.assertIn('mode="interactive"', text)
+        self.assertIn('cwd="/work/project\\nunsafe"', text)
+        self.assertIn(
+            'session_id="00000000-0000-4000-8000-000000000000"', text
+        )
+        self.assertIn(
+            "claude --resume 00000000-0000-4000-8000-000000000000", text
+        )
+        self.assertIn("reapply any launch policy", text)
+        self.assertNotIn("secret-value", text)
+        self.assertEqual((directory / "meta.json").read_bytes(), before)
+
+    def test_install_report_never_fabricates_resume_command(self):
+        run_id = "4" * 32
+        self.create_run(
+            run_id,
+            mode="interactive",
+            cwd="/work",
+            session_id="not-a-session; touch bad",
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            self.module, "run_is_live", return_value=True
+        ), mock.patch.object(sys, "stdout", output):
+            self.assertEqual(self.module.install_report_active(), 0)
+        text = output.getvalue()
+        self.assertIn("normal resume selection", text)
+        self.assertNotIn("claude --resume", text)
+        self.assertNotIn(run_id, text)
+
+    def test_current_tmux_stock_border_format_is_accepted(self):
+        value = (
+            '#{?pane_active,#[reverse],}#{pane_index}#[default] "#{pane_title}"'
+            '#{?#{mouse},#[align=right]#[range=control|8]'
+            '[#{?#{window_zoomed_flag},u,z}]#[norange]'
+            '#[range=control|9][x]#[norange],}'
+        )
+        self.assertTrue(self.module.stock_pane_border_format(value))
+        self.assertFalse(
+            self.module.stock_pane_border_format(value.replace("pane_title", "custom"))
+        )
+
+    def test_skip_and_pause_serialize_with_initial_submission(self):
+        run_id = "5" * 32
+        directory = self.create_run(
+            run_id,
+            name="serialized",
+            main_pane="%50",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        injection_started = threading.Event()
+        release_injection = threading.Event()
+        skip_result = []
+        pause_result = []
+
+        def inject(*_):
+            injection_started.set()
+            release_injection.wait(2)
+            return time.monotonic()
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {
+                "timeout": {
+                    "delays": (0.01, 0.01, 0.01),
+                    "label": "请求超时",
+                }
+            },
+            clear=False,
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", side_effect=inject
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ), mock.patch("builtins.print"):
+            watchdog = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "hidden"),
+                daemon=True,
+            )
+            watchdog.start()
+            try:
+                deadline = time.time() + 2
+                while not (directory / "ready").exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.module.send_run_event(
+                    run_id,
+                    {
+                        "kind": "recoverable_failure",
+                        "at": time.time(),
+                        "run_id": run_id,
+                        "session_id": "session-1",
+                        "prompt_id": "prompt-1",
+                        "category": "timeout",
+                        "subagent": False,
+                    },
+                )
+                self.assertTrue(injection_started.wait(2))
+                skipper = threading.Thread(
+                    target=lambda: skip_result.append(
+                        self.module.skip_run("serialized")
+                    ),
+                    daemon=True,
+                )
+                pauser = threading.Thread(
+                    target=lambda: pause_result.append(
+                        self.module.set_pause("serialized", True)
+                    ),
+                    daemon=True,
+                )
+                skipper.start()
+                pauser.start()
+                time.sleep(0.05)
+                self.assertTrue(skipper.is_alive())
+                self.assertTrue(pauser.is_alive())
+                release_injection.set()
+                skipper.join(2)
+                pauser.join(2)
+                self.assertEqual(skip_result, [1])
+                self.assertEqual(pause_result, [0])
+                self.assertFalse((directory / "cancel").exists())
+                self.assertTrue((directory / "paused").exists())
+            finally:
+                release_injection.set()
+                alive["value"] = False
+                watchdog.join(2)
+                self.assertFalse(watchdog.is_alive())
+
+    def test_status_presentation_uses_terminal_cell_width(self):
+        self.assertEqual(
+            self.module.present_status(
+                "paused", "恢复恢复恢复恢复恢复恢复", width=10,
+                color=False, unicode=True,
+            ),
+            "○ 恢复恢…",
+        )
+        self.assertEqual(
+            self.module.terminal_cell_width("○ 恢复恢…"), 9
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "ready", "éééé", width=7,
+                color=False, unicode=True,
+            ),
+            "● éééé",
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "ready", "Recovery ready", width=1,
+                color=False, unicode=True,
+            ),
+            "●",
+        )
+        self.assertEqual(
+            self.module.present_status(
+                "ready", "Recovery ready", width=0,
+                color=False, unicode=True,
+            ),
+            "",
+        )
+
+    def test_fallback_pane_uses_ansi_not_tmux_style_tokens(self):
+        buffer = io.StringIO()
+        output = mock.Mock()
+        output.isatty.return_value = True
+        output.encoding = "utf-8"
+        output.write.side_effect = buffer.write
+        output.flush.side_effect = buffer.flush
+        with mock.patch.object(sys, "stdout", output), mock.patch.dict(
+            os.environ, {"TERM": "xterm-256color"}, clear=True
+        ), mock.patch.object(
+            self.module.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))
+        ):
+            self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.2", "pane", {}
+            )
+        rendered = buffer.getvalue()
+        self.assertIn("\x1b[36m●\x1b[0m", rendered)
+        self.assertNotIn("#[", rendered)
 
     def test_session_lock_is_single_flight(self):
         first = "a" * 32
@@ -134,7 +1090,9 @@ class RuntimeSafetyTests(unittest.TestCase):
             },
             run_id,
         )
-        self.assertEqual(generic, [])
+        self.assertEqual(len(generic), 1)
+        self.assertEqual(generic[0]["kind"], "unsupported_failure")
+        self.assertNotIn("category", generic[0])
         subagent = self.run_hook(
             {
                 "hook_event_name": "StopFailure",
@@ -148,6 +1106,22 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(len(subagent), 1)
         self.assertEqual(subagent[0]["category"], "timeout")
         self.assertTrue(subagent[0]["subagent"])
+
+    def test_unsupported_main_failure_is_reported_to_end_active_recovery(self):
+        run_id = "2" * 32
+        self.create_run(run_id)
+        events = self.run_hook(
+            {
+                "hook_event_name": "StopFailure",
+                "session_id": "session-1",
+                "prompt_id": "unsupported",
+                "error_details": "API Error: 400 invalid request",
+            },
+            run_id,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "unsupported_failure")
+        self.assertFalse(events[0]["subagent"])
 
     def test_hook_routes_structured_error_type_to_watchdog(self):
         run_id = "1" * 32
@@ -312,12 +1286,174 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertFalse(self.module.inject_recovery({"main_pane": "%7"}, prompt, run_id))
         self.assertFalse(self.module.consume_expected_recovery(run_id, prompt))
 
-    def test_client_interrupt_cancels_pending_recovery(self):
+    def test_skip_command_only_accepts_pending_countdown(self):
+        run_id = "6" * 32
+        directory = self.create_run(run_id, name="demo")
+        self.module.write_status(run_id, "countdown", retry_count=1)
+        output = io.StringIO()
+        with mock.patch.object(sys, "stdout", output):
+            self.assertEqual(self.module.management_main(["skip", "demo"]), 0)
+        self.assertEqual(output.getvalue(), "Skipped pending recovery for demo.\n")
+        self.assertTrue((directory / "cancel").exists())
+
+        (directory / "cancel").unlink()
+        self.module.write_status(run_id, "submitting", retry_count=1)
+        output = io.StringIO()
+        with mock.patch.object(sys, "stderr", output):
+            self.assertEqual(self.module.management_main(["skip", "demo"]), 1)
+        self.assertIn("already submitting", output.getvalue())
+        self.assertFalse((directory / "cancel").exists())
+
+    def test_headless_skip_stops_pending_recovery_countdown(self):
+        run_id = "9" * 32
+        attempts = []
+        result = {}
+        lifecycle = mock.Mock()
+        failure = {
+            "kind": "recoverable_failure",
+            "at": time.time(),
+            "run_id": run_id,
+            "session_id": "00000000-0000-4000-8000-000000000009",
+            "prompt_id": "prompt-1",
+            "category": "timeout",
+            "subagent": False,
+        }
+
+        def run_attempt(*_):
+            attempts.append(True)
+            if len(attempts) == 1:
+                return 1, [failure], None, None
+            return 0, [], None, None
+
+        with mock.patch.object(
+            self.module, "add_managed_session_id",
+            return_value=(
+                ["-p"],
+                "00000000-0000-4000-8000-000000000009",
+                False,
+            ),
+        ), mock.patch.object(
+            self.module.uuid, "uuid4", return_value=mock.Mock(hex=run_id)
+        ), mock.patch.object(
+            self.module, "run_headless_attempt", side_effect=run_attempt
+        ), mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {"timeout": {"delays": (10, 10, 10), "label": "请求超时"}},
+            clear=False,
+        ):
+            thread = threading.Thread(
+                target=lambda: result.update(
+                    code=self.module.headless_main(["-p"], lifecycle=lifecycle)
+                ),
+                daemon=True,
+            )
+            thread.start()
+            directory = self.module.run_dir(run_id)
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "countdown"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(self.module.skip_run("headless-" + run_id[:8]), 0)
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result["code"], 1)
+        self.assertEqual(len(attempts), 1)
+
+    def test_client_interrupt_stops_pending_submit_retries(self):
         run_id = "2" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%18",
+            tmux_identity="pane-18",
+            cancel_binding=False,
+        )
+        alive = {"value": True}
+        retry_keys = []
+        prompt = self.module.recovery_message(1, "timeout")
+
+        def inject(*_):
+            self.module.mark_expected_recovery(run_id, prompt)
+            return time.monotonic()
+
+        def tmux_run(arguments, **_):
+            if arguments[0] == "attach-session":
+                raise KeyboardInterrupt
+            if arguments[0] == "send-keys" and arguments[-1] == "Enter":
+                retry_keys.append(arguments)
+            return Result()
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {"timeout": {"delays": (0.01, 0.01, 0.01), "label": "请求超时"}},
+            clear=False,
+        ), mock.patch.object(
+            self.module, "SUBMIT_RETRY_DELAY", 0.2
+        ), mock.patch.object(
+            self.module, "SUBMISSION_ACK_TIMEOUT", 0.4
+        ), mock.patch.object(
+            self.module, "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "inject_recovery", side_effect=inject
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.module.send_run_event(run_id, {
+                "kind": "recoverable_failure",
+                "at": time.time(),
+                "run_id": run_id,
+                "session_id": "session-1",
+                "prompt_id": "prompt-1",
+                "category": "timeout",
+                "subagent": False,
+            })
+            deadline = time.time() + 2
+            while not self.module.expected_recovery_path(run_id).exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.attach_managed_session(run_id, "managed"), 130
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(directory / "status.json", {}).get("state")
+                != "cancelled"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            time.sleep(0.5)
+            self.assertEqual(retry_keys, [])
+            self.assertFalse((directory / "cancel").exists())
+            alive["value"] = False
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+
+    def test_client_interrupt_without_pending_recovery_leaves_no_cancel_marker(self):
+        run_id = "a" * 32
         self.create_run(run_id)
+        self.module.write_status(run_id, "ready", retry_count=0)
         with mock.patch.object(self.module, "tmux_run", side_effect=KeyboardInterrupt):
             self.assertEqual(self.module.attach_managed_session(run_id, "session-1"), 130)
-        self.assertTrue((self.module.run_dir(run_id) / "cancel").exists())
+        self.assertFalse((self.module.run_dir(run_id) / "cancel").exists())
 
     def test_headless_socket_failure_releases_state(self):
         lifecycle = mock.Mock()
@@ -444,6 +1580,32 @@ class RuntimeSafetyTests(unittest.TestCase):
                     directory / "status.json", {}
                 ).get("state"),
                 "awaiting",
+            )
+            self.module.send_run_event(
+                run_id,
+                {
+                    "kind": "unsupported_failure",
+                    "at": time.time(),
+                    "run_id": run_id,
+                    "session_id": "session-1",
+                    "prompt_id": "unsupported",
+                    "subagent": False,
+                },
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "unsupported"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "unsupported",
             )
             alive["value"] = False
             thread.join(2)
@@ -608,7 +1770,7 @@ class RuntimeSafetyTests(unittest.TestCase):
                 },
             )
             deadline = time.time() + 2
-            while self.module.read_json(directory / "status.json", {}).get("state") != "submitting" and time.time() < deadline:
+            while not self.module.expected_recovery_path(run_id).exists() and time.time() < deadline:
                 time.sleep(0.01)
             self.assertTrue(self.module.consume_expected_recovery(run_id, prompt))
             deadline = time.time() + 2
@@ -1092,12 +2254,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             thread.join(2)
             self.assertFalse(thread.is_alive())
 
-    def test_cancelled_acknowledged_recovery_cannot_schedule_another_enter(self):
+    def test_skip_shortcut_cannot_cancel_acknowledged_recovery(self):
         run_id = "b" * 32
         directory = self.create_run(
             run_id,
             main_pane="%14",
-            cancel_binding=False,
+            tmux_session="managed",
+            window_id="@14",
+            cancel_binding=True,
         )
         alive = {"value": True}
         injections = []
@@ -1152,13 +2316,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             }
             self.module.send_run_event(run_id, failure)
             deadline = time.time() + 2
-            while (
-                self.module.read_json(
-                    directory / "status.json", {}
-                ).get("state")
-                != "submitting"
-                and time.time() < deadline
-            ):
+            while not self.module.expected_recovery_path(run_id).exists() and time.time() < deadline:
                 time.sleep(0.01)
             events = self.run_hook(
                 {
@@ -1179,29 +2337,21 @@ class RuntimeSafetyTests(unittest.TestCase):
                 and time.time() < deadline
             ):
                 time.sleep(0.01)
-            (directory / "cancel").touch()
-            deadline = time.time() + 2
-            while (
-                self.module.read_json(
-                    directory / "status.json", {}
-                ).get("state")
-                != "cancelled"
-                and time.time() < deadline
-            ):
-                time.sleep(0.01)
-            (directory / "cancel").touch()
-            time.sleep(0.3)
+            self.assertEqual(
+                self.module.cancel_target("managed", "@14"), 1
+            )
+            self.assertFalse((directory / "cancel").exists())
             self.module.send_run_event(
                 run_id,
                 dict(failure, prompt_id="prompt-2", at=time.time()),
             )
-            time.sleep(0.35)
-            self.assertEqual(len(injections), 1)
-            self.assertEqual(
-                self.module.read_json(
-                    directory / "status.json", {}
-                ).get("state"),
-                "cancelled",
+            deadline = time.time() + 2
+            while len(injections) < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(injections), 2)
+            self.assertIn(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                {"submitting", "awaiting"},
             )
             alive["value"] = False
             thread.join(2)
@@ -1216,6 +2366,8 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.ERROR_POLICIES,
             {"timeout": {"delays": (0.2, 0.2, 0.2), "label": "请求超时"}},
             clear=False,
+        ), mock.patch.object(
+            self.module, "RESULT_FEEDBACK_SECONDS", 0.1
         ), mock.patch.object(
             self.module, "tmux_target_alive", side_effect=lambda *_: alive["value"]
         ), mock.patch.object(
@@ -1249,8 +2401,21 @@ class RuntimeSafetyTests(unittest.TestCase):
             while self.module.read_json(directory / "status.json", {}).get("state") != "countdown" and time.time() < deadline:
                 time.sleep(0.01)
             (directory / "cancel").touch()
-            time.sleep(0.35)
+            deadline = time.time() + 2
+            while self.module.read_json(directory / "status.json", {}).get("state") != "skipped" and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "skipped",
+            )
             self.assertEqual(sent, [])
+            deadline = time.time() + 2
+            while self.module.read_json(directory / "status.json", {}).get("state") != "ready" and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "ready",
+            )
             alive["value"] = False
             thread.join(2)
             self.assertFalse(thread.is_alive())

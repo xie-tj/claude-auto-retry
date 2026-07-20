@@ -422,6 +422,12 @@ CLAUDE_AUTO_STATE_DIR="$STATE_DIR" \
 CLAUDE_AUTO_SETTINGS_PATH="$SETTINGS_PATH" \
 "$PYTHON" "$SOURCE_PATH" install-self-test >/dev/null
 
+CLAUDE_AUTO_APP_DIR="$APP_DIR" \
+CLAUDE_AUTO_CONFIG_DIR="$CONFIG_DIR" \
+CLAUDE_AUTO_STATE_DIR="$STATE_DIR" \
+CLAUDE_AUTO_SETTINGS_PATH="$SETTINGS_PATH" \
+"$PYTHON" "$SOURCE_PATH" install-report-active
+
 printf '%s\n' "claude-auto installed successfully."
 printf '  Claude Code: %s\n' "$RAW_CLAUDE"
 printf '  tmux:       %s\n' "$TMUX"
