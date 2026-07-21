@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -117,6 +117,9 @@ RETRY_STATE_EXPIRY = 10 * 60
 PASTE_SETTLE_DELAY = 0.25
 SUBMIT_RETRY_DELAY = 0.25
 SUBMISSION_ACK_TIMEOUT = 5
+TERMINAL_FAILURE_GRACE = 1
+TERMINAL_HOOK_DEDUP_WINDOW = 5
+TERMINAL_POLL_INTERVAL = 0.25
 RESULT_FEEDBACK_SECONDS = 2
 UPDATE_CHECK_INTERVAL = 5
 TEMP_MAX_MEMORY = 8 * 1024 * 1024
@@ -1135,6 +1138,42 @@ def is_paused(run_id):
     return GLOBAL_PAUSE.exists() or (run_dir(run_id) / "paused").exists()
 
 
+def terminal_failure_observation(meta):
+    pane = meta.get("main_pane")
+    if not pane:
+        return None
+    try:
+        position = tmux_run(
+            [
+                "display-message", "-p", "-t", pane,
+                "#{history_size}:#{cursor_y}:#{cursor_x}",
+            ],
+            capture=True,
+            timeout=1,
+        )
+        result = tmux_run(
+            ["capture-pane", "-p", "-t", pane, "-S", "-12"],
+            capture=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if position.returncode != 0 or result.returncode != 0:
+        return None
+    lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    line = lines[-1]
+    normalized = normalize_text(line)
+    if not re.match(r"^⏺\s*api error\s*:", normalized):
+        return None
+    category = classify_failure({"last_assistant_message": line})
+    if not category:
+        return None
+    identity = "{}\n{}".format((position.stdout or "").strip(), line)
+    return category, hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
 def inject_recovery(meta, message, run_id):
     pane = meta.get("main_pane")
     if not pane or not tmux_target_alive(pane, meta.get("tmux_identity")):
@@ -1311,10 +1350,39 @@ def watchdog_main(run_id, display_mode):
     loaded_fingerprint = script_fingerprint()
     next_update_check = time.monotonic() + UPDATE_CHECK_INTERVAL
     pane_dead_since = None
+    terminal_seen = None
+    terminal_candidate = None
+    terminal_fallback_at = None
+    terminal_fallback_observation = None
+    terminal_hook_at = None
+    terminal_hook_category = None
+    terminal_fired_at = None
+    terminal_fired_category = None
+    next_terminal_poll = time.monotonic()
 
     def handle(event, deferred=False):
-        nonlocal retry_count, retry_updated_at, pending, submission, deferred_failures, recovery_suppressed, got_session_end, current_state, meta
+        nonlocal retry_count, retry_updated_at, pending, submission, deferred_failures, recovery_suppressed, got_session_end, current_state, meta, terminal_fallback_at, terminal_fallback_observation, terminal_hook_at, terminal_hook_category, terminal_fired_at, terminal_fired_category
         kind = event.get("kind")
+        category = event.get("category")
+        terminal_source = event.get("source") == "terminal_fallback"
+        if (
+            kind == "recoverable_failure"
+            and not terminal_source
+            and not event.get("subagent")
+            and terminal_fired_category == category
+            and terminal_fired_at is not None
+            and time.monotonic() - terminal_fired_at <= TERMINAL_HOOK_DEDUP_WINDOW
+        ):
+            log_event(run_id, "terminal_fallback_hook_deduplicated", category=category)
+            return
+        if kind in {"recoverable_failure", "unsupported_failure"} and not event.get("subagent"):
+            terminal_fallback_at = None
+            terminal_fallback_observation = None
+            terminal_hook_at = time.monotonic()
+            terminal_hook_category = category
+        if terminal_source:
+            terminal_fired_at = time.monotonic()
+            terminal_fired_category = category
         meta = get_meta(run_id)
         if kind == "session_start":
             log_event(run_id, kind)
@@ -1461,6 +1529,48 @@ def watchdog_main(run_id, display_mode):
                     break
             else:
                 pane_dead_since = None
+            now = time.monotonic()
+            if now >= next_terminal_poll:
+                next_terminal_poll = now + TERMINAL_POLL_INTERVAL
+                observed = terminal_failure_observation(meta)
+                if observed != terminal_seen:
+                    terminal_seen = observed
+                    terminal_candidate = observed
+                    category = observed[0] if observed else None
+                    recently_hooked = (
+                        category
+                        and terminal_hook_category == category
+                        and terminal_hook_at is not None
+                        and now - terminal_hook_at <= TERMINAL_HOOK_DEDUP_WINDOW
+                    )
+                    terminal_fallback_at = (
+                        now + TERMINAL_FAILURE_GRACE
+                        if observed and not recently_hooked
+                        else None
+                    )
+                    terminal_fallback_observation = (
+                        observed if not recently_hooked else None
+                    )
+            if (
+                terminal_fallback_at is not None
+                and now >= terminal_fallback_at
+                and terminal_candidate == terminal_fallback_observation
+            ):
+                observation = terminal_fallback_observation
+                category = observation[0]
+                terminal_fallback_at = None
+                terminal_fallback_observation = None
+                handle(
+                    event_record(
+                        "recoverable_failure",
+                        run_id,
+                        session_id=meta.get("session_id") or "unknown",
+                        prompt_id="terminal-{}".format(time.time_ns()),
+                        category=category,
+                        subagent=False,
+                        source="terminal_fallback",
+                    )
+                )
             cancel_requested = (directory / "cancel").exists()
             if cancel_requested and current_state == "countdown" and pending:
                 consume_cancel(run_id)
