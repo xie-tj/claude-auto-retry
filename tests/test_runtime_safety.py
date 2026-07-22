@@ -296,6 +296,230 @@ class RuntimeSafetyTests(unittest.TestCase):
             ]],
         )
 
+    def test_border_renderer_retries_after_tmux_exception(self):
+        attempts = []
+
+        def tmux_run(arguments, **_):
+            attempts.append(arguments)
+            if len(attempts) == 1:
+                raise OSError("tmux unavailable")
+            return Result()
+
+        with mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ):
+            failed_frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "border",
+                {"window_id": "@7"},
+            )
+            rendered_frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "border",
+                {"window_id": "@7"}, failed_frame,
+            )
+
+        self.assertIsNone(failed_frame)
+        self.assertEqual(
+            rendered_frame,
+            (
+                "border",
+                "@7",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+            ),
+        )
+        self.assertEqual(len(attempts), 2)
+
+    def test_idle_watchdog_does_not_redraw_unchanged_border_status(self):
+        run_id = "d" * 32
+        self.create_run(
+            run_id,
+            main_pane="%42",
+            window_id="@7",
+            cancel_binding=False,
+        )
+        status_calls = []
+        settled = threading.Event()
+        unchanged_polls = 0
+
+        def tmux_run(arguments, **_):
+            if arguments[:5] == [
+                "set-option", "-w", "-t", "@7",
+                "@claude_auto_watchdog_status",
+            ]:
+                status_calls.append(arguments)
+            return Result()
+
+        def observe_terminal(_):
+            nonlocal unchanged_polls
+            if status_calls:
+                unchanged_polls += 1
+                if unchanged_polls >= 2:
+                    settled.set()
+            return None
+
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "terminal_failure_observation",
+            side_effect=observe_terminal,
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "border"),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(
+                settled.wait(2), "watchdog did not complete repeated render cycles"
+            )
+            self.module.send_run_event(
+                run_id,
+                self.module.event_record(
+                    "session_end", run_id, session_id="session-1"
+                ),
+            )
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(status_calls), 1)
+
+    def test_watchdog_renders_each_changed_border_status_once(self):
+        run_id = "e" * 32
+        self.create_run(
+            run_id,
+            main_pane="%42",
+            window_id="@7",
+            cancel_binding=False,
+        )
+        status_values = []
+        first_rendered = threading.Event()
+        settled = threading.Event()
+        unchanged_polls = 0
+
+        def tmux_run(arguments, **_):
+            if arguments[:5] == [
+                "set-option", "-w", "-t", "@7",
+                "@claude_auto_watchdog_status",
+            ]:
+                status_values.append(arguments[-1])
+                if len(status_values) == 1:
+                    first_rendered.set()
+            return Result()
+
+        def observe_terminal(_):
+            nonlocal unchanged_polls
+            if len(status_values) >= 2:
+                unchanged_polls += 1
+                if unchanged_polls >= 2:
+                    settled.set()
+            return None
+
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "terminal_failure_observation",
+            side_effect=observe_terminal,
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "border"),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(first_rendered.wait(2), "ready status was not rendered")
+            self.module.GLOBAL_PAUSE.touch(mode=0o600)
+            self.assertTrue(
+                settled.wait(2), "paused status did not settle after rendering"
+            )
+            self.module.send_run_event(
+                run_id,
+                self.module.event_record(
+                    "session_end", run_id, session_id="session-1"
+                ),
+            )
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            status_values,
+            [
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[dim]○#[default] Recovery paused globally · claude-auto resume",
+            ],
+        )
+
+    def test_watchdog_retries_border_status_that_failed_to_render(self):
+        run_id = "f" * 32
+        self.create_run(
+            run_id,
+            main_pane="%42",
+            window_id="@7",
+            cancel_binding=False,
+        )
+        status_values = []
+        settled = threading.Event()
+        unchanged_polls = 0
+
+        def tmux_run(arguments, **_):
+            if arguments[:5] == [
+                "set-option", "-w", "-t", "@7",
+                "@claude_auto_watchdog_status",
+            ]:
+                status_values.append(arguments[-1])
+                return Result(returncode=1 if len(status_values) == 1 else 0)
+            return Result()
+
+        def observe_terminal(_):
+            nonlocal unchanged_polls
+            if len(status_values) >= 2:
+                unchanged_polls += 1
+                if unchanged_polls >= 2:
+                    settled.set()
+            return None
+
+        with mock.patch.object(
+            self.module, "tmux_target_alive", return_value=True
+        ), mock.patch.object(
+            self.module, "terminal_failure_observation",
+            side_effect=observe_terminal,
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "border"),
+                daemon=True,
+            )
+            thread.start()
+            self.assertTrue(
+                settled.wait(2), "successful retry did not settle"
+            )
+            self.module.send_run_event(
+                run_id,
+                self.module.event_record(
+                    "session_end", run_id, session_id="session-1"
+                ),
+            )
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            status_values,
+            [
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+            ],
+        )
+
     def test_tmux_display_preserves_custom_border_and_hides_on_short_terminal(self):
         custom_run = "3" * 32
         self.create_run(custom_run, window_id="@8", main_pane="%43")
@@ -1055,6 +1279,66 @@ class RuntimeSafetyTests(unittest.TestCase):
         rendered = buffer.getvalue()
         self.assertIn("\x1b[36m●\x1b[0m", rendered)
         self.assertNotIn("#[", rendered)
+
+    def test_pane_renderer_retries_after_terminal_write_failure(self):
+        output = mock.Mock()
+        output.isatty.return_value = True
+        output.encoding = "utf-8"
+        output.write.side_effect = [OSError("terminal unavailable"), None]
+
+        with mock.patch.object(sys, "stdout", output), mock.patch.dict(
+            os.environ, {"TERM": "xterm-256color"}, clear=True
+        ), mock.patch.object(
+            self.module.shutil, "get_terminal_size",
+            return_value=os.terminal_size((80, 24)),
+        ):
+            failed_frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}
+            )
+            rendered_frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}, failed_frame
+            )
+            same_frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}, rendered_frame
+            )
+
+        self.assertIsNone(failed_frame)
+        self.assertEqual(rendered_frame, same_frame)
+        self.assertEqual(output.write.call_count, 2)
+        self.assertEqual(output.flush.call_count, 1)
+
+    def test_pane_renderer_deduplicates_final_frame_but_redraws_after_resize(self):
+        buffer = io.StringIO()
+        output = mock.Mock()
+        output.isatty.return_value = True
+        output.encoding = "utf-8"
+        output.write.side_effect = buffer.write
+        output.flush.side_effect = buffer.flush
+        sizes = iter(
+            [
+                os.terminal_size((80, 24)),
+                os.terminal_size((80, 24)),
+                os.terminal_size((60, 24)),
+            ]
+        )
+
+        with mock.patch.object(sys, "stdout", output), mock.patch.dict(
+            os.environ, {"TERM": "xterm-256color"}, clear=True
+        ), mock.patch.object(
+            self.module.shutil, "get_terminal_size", side_effect=sizes
+        ):
+            frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}
+            )
+            frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}, frame
+            )
+            frame = self.module.render_watchdog_status(
+                "ready", "Recovery ready · v1.0.3", "pane", {}, frame
+            )
+
+        self.assertEqual(output.write.call_count, 2)
+        self.assertEqual(frame[0:2], ("pane", 60))
 
     def test_session_lock_is_single_flight(self):
         first = "a" * 32

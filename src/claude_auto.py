@@ -1065,39 +1065,55 @@ def pane_status(state, text, width, color, unicode):
     return ansi_status_style(state, symbol) + line[len(symbol):]
 
 
-def render_watchdog_status(state, text, mode, meta):
+def render_watchdog_status(state, text, mode, meta, previous_frame=None):
     if mode == "hidden":
-        return
+        return ("hidden",)
     if mode == "pane":
         width = shutil.get_terminal_size((100, 1)).columns
         color, unicode = terminal_capabilities(sys.stdout)
         line = pane_status(
             state, text, width=max(1, width - 1), color=color, unicode=unicode
         )
-        sys.stdout.write("\033[2J\033[H" + line)
-        sys.stdout.flush()
-        return
+        frame = ("pane", width, line)
+        if frame == previous_frame:
+            return previous_frame
+        try:
+            sys.stdout.write("\033[2J\033[H" + line)
+            sys.stdout.flush()
+        except OSError:
+            return previous_frame
+        return frame
     if mode == "border":
         window = meta.get("window_id")
         if not window:
-            return
+            return previous_frame
         color, unicode = terminal_capabilities(sys.stdout, assume_tty=True)
         value = present_status(
             state, text.replace("#", "##"), width=100, color=color, unicode=unicode
         )
-        result = tmux_run(
-            [
-                "set-option", "-w", "-t", window,
-                "@claude_auto_watchdog_status", value,
-            ],
-            capture=True,
-        )
-        if result.returncode == 0 and meta.get("run_id"):
+        frame = ("border", window, value)
+        if frame == previous_frame:
+            return previous_frame
+        try:
+            result = tmux_run(
+                [
+                    "set-option", "-w", "-t", window,
+                    "@claude_auto_watchdog_status", value,
+                ],
+                capture=True,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return previous_frame
+        if result.returncode != 0:
+            return previous_frame
+        if meta.get("run_id"):
             owned = meta.get("tmux_border_owned")
             owned = dict(owned) if isinstance(owned, dict) else {}
             owned["@claude_auto_watchdog_status"] = value
             meta["tmux_border_owned"] = owned
             update_meta(meta["run_id"], tmux_border_owned=owned)
+        return frame
+    return previous_frame
 
 
 def read_pending_events(directory):
@@ -1347,6 +1363,7 @@ def watchdog_main(run_id, display_mode):
     current_state = "ready"
     write_status(run_id, "ready", retry_count=0)
     last_render = 0.0
+    rendered_frame = None
     loaded_fingerprint = script_fingerprint()
     next_update_check = time.monotonic() + UPDATE_CHECK_INTERVAL
     pane_dead_since = None
@@ -1849,7 +1866,9 @@ def watchdog_main(run_id, display_mode):
                     )
                 else:
                     text = status_text(current_state, meta, retry_count, binding=binding)
-                render_watchdog_status(current_state, text, display_mode, meta)
+                rendered_frame = render_watchdog_status(
+                    current_state, text, display_mode, meta, rendered_frame
+                )
                 last_render = now
     finally:
         server.close()
