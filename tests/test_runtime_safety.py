@@ -106,7 +106,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         cases = [
             (
                 self.module.status_text("ready", {"name": "demo"}),
-                "Recovery ready · v1.0.3",
+                "Recovery ready · v1.0.4",
             ),
             (
                 self.module.status_text(
@@ -195,9 +195,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(shortest, "[~] Recovery 1/3 14s")
         self.assertEqual(
             self.module.present_status(
-                "ready", "Recovery ready · v1.0.3", width=80, color=False, unicode=False
+                "ready", "Recovery ready · v1.0.4", width=80, color=False, unicode=False
             ),
-            "[o] Recovery ready | v1.0.3",
+            "[o] Recovery ready | v1.0.4",
         )
         self.assertEqual(
             self.module.present_status(
@@ -285,14 +285,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             side_effect=lambda arguments, **_: calls.append(arguments) or Result(),
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "border", meta
+                "ready", "Recovery ready · v1.0.4", "border", meta
             )
 
         self.assertEqual(
             calls,
             [[
                 "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
             ]],
         )
 
@@ -309,11 +309,11 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module, "tmux_run", side_effect=tmux_run
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "border",
+                "ready", "Recovery ready · v1.0.4", "border",
                 {"window_id": "@7"},
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "border",
+                "ready", "Recovery ready · v1.0.4", "border",
                 {"window_id": "@7"}, failed_frame,
             )
 
@@ -323,7 +323,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             (
                 "border",
                 "@7",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
             ),
         )
         self.assertEqual(len(attempts), 2)
@@ -450,7 +450,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
                 "#[dim]○#[default] Recovery paused globally · claude-auto resume",
             ],
         )
@@ -515,8 +515,8 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.3",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
             ],
         )
 
@@ -1274,7 +1274,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}
+                "ready", "Recovery ready · v1.0.4", "pane", {}
             )
         rendered = buffer.getvalue()
         self.assertIn("\x1b[36m●\x1b[0m", rendered)
@@ -1293,13 +1293,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             return_value=os.terminal_size((80, 24)),
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}
+                "ready", "Recovery ready · v1.0.4", "pane", {}
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}, failed_frame
+                "ready", "Recovery ready · v1.0.4", "pane", {}, failed_frame
             )
             same_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}, rendered_frame
+                "ready", "Recovery ready · v1.0.4", "pane", {}, rendered_frame
             )
 
         self.assertIsNone(failed_frame)
@@ -1328,13 +1328,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", side_effect=sizes
         ):
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}
+                "ready", "Recovery ready · v1.0.4", "pane", {}
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.4", "pane", {}, frame
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.3", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.4", "pane", {}, frame
             )
 
         self.assertEqual(output.write.call_count, 2)
@@ -1494,6 +1494,87 @@ class RuntimeSafetyTests(unittest.TestCase):
                 thread.join(2)
                 self.assertFalse(thread.is_alive())
 
+    def test_multiline_terminal_overload_triggers_recovery(self):
+        run_id = "b" * 32
+        directory = self.create_run(
+            run_id,
+            main_pane="%44",
+            tmux_identity="pane-44",
+            cancel_binding=False,
+            session_id="session-terminal-overload",
+        )
+        alive = {"value": True}
+        pane = {"text": "Ready"}
+        calls = []
+
+        def tmux_run(arguments, **_):
+            if arguments[0] == "capture-pane":
+                return Result(stdout=pane["text"])
+            calls.append(arguments)
+            return Result()
+
+        with mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {"overloaded": {"delays": (0, 0, 0), "label": "服务过载"}},
+            clear=False,
+        ), mock.patch.object(
+            self.module,
+            "tmux_target_alive",
+            side_effect=lambda *_: alive["value"],
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=tmux_run
+        ), mock.patch.object(
+            self.module, "TERMINAL_FAILURE_GRACE", 0
+        ), mock.patch.object(
+            self.module, "TERMINAL_POLL_INTERVAL", 0.01
+        ), mock.patch.object(
+            self.module, "PASTE_SETTLE_DELAY", 0
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ), mock.patch.object(
+            self.module, "release_tmux_binding"
+        ), mock.patch.object(
+            self.module, "cleanup_run"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, "hidden"),
+                daemon=True,
+            )
+            thread.start()
+            try:
+                deadline = time.time() + 2
+                while not (directory / "ready").exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((directory / "ready").exists())
+
+                pane["text"] = (
+                    "⏺ API Error: 422 format conversion error: Responses upstream "
+                    "service_unavailable_error:\n"
+                    "Our servers are currently overloaded. Please try again later."
+                )
+                submit = ["send-keys", "-t", "%44", "Enter"]
+                deadline = time.time() + 2
+                while submit not in calls and time.time() < deadline:
+                    time.sleep(0.01)
+
+                self.assertIn(
+                    [
+                        "paste-buffer", "-b", "claude-auto-bbbbbbbbbbbb",
+                        "-d", "-t", "%44",
+                    ],
+                    calls,
+                )
+                self.assertEqual(calls.count(submit), 1)
+                buffers = [call for call in calls if call[0] == "set-buffer"]
+                self.assertEqual(len(buffers), 1)
+                self.assertIn("服务过载", buffers[0][-1])
+                self.assertTrue(thread.is_alive())
+            finally:
+                alive["value"] = False
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+
     def test_terminal_fallback_ignores_subagent_failure_and_deduplicates_late_hook(self):
         run_id = "a" * 32
         directory = self.create_run(
@@ -1625,11 +1706,66 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(first[1], changed_history[1])
         self.assertNotEqual(changed_history[1], repeated[1])
 
-    def test_terminal_failure_observation_requires_decorated_final_status_line(self):
+    def test_terminal_failure_observation_accepts_multiline_current_error(self):
+        text = (
+            "old terminal output\n"
+            "⏺ API Error: 422 format conversion error: Responses upstream "
+            "service_unavailable_error:\n"
+            "Our servers are currently overloaded. Please try again later."
+        )
+        with mock.patch.object(
+            self.module,
+            "tmux_run",
+            return_value=Result(stdout=text),
+        ):
+            observation = self.module.terminal_failure_observation(
+                {"main_pane": "%42"}
+            )
+        self.assertEqual(observation[0], "overloaded")
+        self.assertEqual(len(observation[1]), 64)
+
+    def test_terminal_failure_observation_joins_wrapped_pane_lines(self):
+        calls = []
+
+        def tmux_run(arguments, **_):
+            calls.append(arguments)
+            if arguments[0] == "display-message":
+                return Result(stdout="10:20:0")
+            return Result(stdout="⏺ API Error: The operation timed out.")
+
+        with mock.patch.object(self.module, "tmux_run", side_effect=tmux_run):
+            observation = self.module.terminal_failure_observation(
+                {"main_pane": "%42"}
+            )
+
+        capture = next(call for call in calls if call[0] == "capture-pane")
+        self.assertIn("-J", capture)
+        self.assertEqual(observation[0], "timeout")
+
+    def test_terminal_failure_observation_requires_decorated_current_status(self):
         rejected = (
             "请解决刚刚发生 ⏺ API Error: The operation timed out. 但是没有成功触发的问题",
             "API Error: The operation timed out.",
             "⏺ API Error: The operation timed out.\nordinary output",
+            (
+                "⏺ API Error: The operation timed out.\n"
+                "The operation timed out earlier; continuing requested work."
+            ),
+            (
+                "⏺ API Error: The operation timed out.\n"
+                "ordinary discussion\n"
+                "The servers are currently overloaded; what should I do?"
+            ),
+            (
+                "⏺ API Error: Responses upstream service_unavailable_error:\n"
+                "ordinary output\n"
+                "Our servers are currently overloaded. Please try again later."
+            ),
+            (
+                "⏺ API Error: Responses upstream service_unavailable_error:\n"
+                "Our servers are currently overloaded. Please try again later.\n"
+                "ordinary output"
+            ),
         )
         for text in rejected:
             with self.subTest(text=text), mock.patch.object(
@@ -2030,7 +2166,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module, "release_tmux_binding"
         ), mock.patch.object(
             self.module, "cleanup_run"
-        ):
+        ) as cleanup_run:
             thread = threading.Thread(
                 target=self.module.watchdog_main,
                 args=(run_id, 0),
@@ -2092,6 +2228,35 @@ class RuntimeSafetyTests(unittest.TestCase):
                 ).get("state"),
                 "awaiting",
             )
+            self.assertTrue(thread.is_alive())
+            cleanup_run.assert_not_called()
+            self.module.send_run_event(
+                run_id,
+                {
+                    "kind": "prompt_submit",
+                    "at": time.time(),
+                    "run_id": run_id,
+                    "session_id": "session-1",
+                    "recovery": False,
+                },
+            )
+            deadline = time.time() + 2
+            while (
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state")
+                != "ready"
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(
+                self.module.read_json(
+                    directory / "status.json", {}
+                ).get("state"),
+                "ready",
+            )
+            self.assertTrue(thread.is_alive())
+            cleanup_run.assert_not_called()
             self.module.send_run_event(
                 run_id,
                 {

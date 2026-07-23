@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -1168,7 +1168,7 @@ def terminal_failure_observation(meta):
             timeout=1,
         )
         result = tmux_run(
-            ["capture-pane", "-p", "-t", pane, "-S", "-12"],
+            ["capture-pane", "-p", "-J", "-t", pane, "-S", "-12"],
             capture=True,
             timeout=1,
         )
@@ -1179,15 +1179,29 @@ def terminal_failure_observation(meta):
     lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
     if not lines:
         return None
-    line = lines[-1]
-    normalized = normalize_text(line)
-    if not re.match(r"^⏺\s*api error\s*:", normalized):
+    marker_index = None
+    for index in range(len(lines) - 1, -1, -1):
+        if re.match(r"^⏺\s*api error\s*:", normalize_text(lines[index])):
+            marker_index = index
+            break
+    if marker_index is None:
         return None
-    category = classify_failure({"last_assistant_message": line})
-    if not category:
+    error_lines = lines[marker_index:]
+    marker_category = classify_failure(
+        {"last_assistant_message": error_lines[0]}
+    )
+    if not marker_category:
         return None
-    identity = "{}\n{}".format((position.stdout or "").strip(), line)
-    return category, hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if len(error_lines) > 1:
+        tail = normalize_text(error_lines[-1])
+        if len(error_lines) != 2 or marker_category != "overloaded" or not re.fullmatch(
+            r"our servers are currently overloaded\. please try again later\.?",
+            tail,
+        ):
+            return None
+    error_text = "\n".join(error_lines)
+    identity = "{}\n{}".format((position.stdout or "").strip(), error_text)
+    return marker_category, hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
 def inject_recovery(meta, message, run_id):

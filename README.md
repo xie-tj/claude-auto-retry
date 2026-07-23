@@ -46,7 +46,7 @@ Our servers are currently overloaded. Please try again later.
 
 未来从终端启动的 `claude` 会运行在受管 tmux session 中：
 
-1. Claude Code 的 `StopFailure` Hook 通常会报告最终 API 失败；如果某些传输层 timeout 只显示终端状态而未触发 Hook，watchdog 会保守识别主 pane 最后一行的 `⏺ API Error:` 状态作为兜底。
+1. Claude Code 的 `StopFailure` Hook 通常会报告最终 API 失败；如果某些传输层 timeout 只显示终端状态而未触发 Hook，watchdog 会保守识别主 pane 末尾的 `⏺ API Error:` 状态作为兜底。单行错误直接识别；多行仅接受 Claude Code 当前已知的固定过载状态格式，已有后续普通输出的旧错误不会触发恢复。
 2. Hook 或终端兜底只将归一化类别 `timeout`、`stream_error` 或 `overloaded` 交给 watchdog；晚到的同类 Hook 会去重。
 3. watchdog 按退避策略倒计时。
 4. 倒计时结束后，它将安全 continuation 粘贴到该会话的精确 tmux pane，等待 250 毫秒让 Claude Code TUI 完成粘贴处理，再发送首次 Enter。
@@ -61,7 +61,7 @@ Our servers are currently overloaded. Please try again later.
 状态示例：
 
 ```text
-● Recovery ready · v1.0.3
+● Recovery ready · v1.0.4
 ◔ Service overloaded · recovery 1/3 in 14s · C-b X skip
 ● Submitting recovery 1/3
 ● Recovery 1/3 active
