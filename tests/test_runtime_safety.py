@@ -106,7 +106,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         cases = [
             (
                 self.module.status_text("ready", {"name": "demo"}),
-                "Recovery ready · v1.0.4",
+                "Recovery ready · v1.0.5",
             ),
             (
                 self.module.status_text(
@@ -195,9 +195,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(shortest, "[~] Recovery 1/3 14s")
         self.assertEqual(
             self.module.present_status(
-                "ready", "Recovery ready · v1.0.4", width=80, color=False, unicode=False
+                "ready", "Recovery ready · v1.0.5", width=80, color=False, unicode=False
             ),
-            "[o] Recovery ready | v1.0.4",
+            "[o] Recovery ready | v1.0.5",
         )
         self.assertEqual(
             self.module.present_status(
@@ -285,14 +285,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             side_effect=lambda arguments, **_: calls.append(arguments) or Result(),
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "border", meta
+                "ready", "Recovery ready · v1.0.5", "border", meta
             )
 
         self.assertEqual(
             calls,
             [[
                 "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
             ]],
         )
 
@@ -309,11 +309,11 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module, "tmux_run", side_effect=tmux_run
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "border",
+                "ready", "Recovery ready · v1.0.5", "border",
                 {"window_id": "@7"},
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "border",
+                "ready", "Recovery ready · v1.0.5", "border",
                 {"window_id": "@7"}, failed_frame,
             )
 
@@ -323,7 +323,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             (
                 "border",
                 "@7",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
             ),
         )
         self.assertEqual(len(attempts), 2)
@@ -450,7 +450,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
                 "#[dim]○#[default] Recovery paused globally · claude-auto resume",
             ],
         )
@@ -515,8 +515,8 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.4",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
             ],
         )
 
@@ -1274,7 +1274,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}
+                "ready", "Recovery ready · v1.0.5", "pane", {}
             )
         rendered = buffer.getvalue()
         self.assertIn("\x1b[36m●\x1b[0m", rendered)
@@ -1293,13 +1293,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             return_value=os.terminal_size((80, 24)),
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}
+                "ready", "Recovery ready · v1.0.5", "pane", {}
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}, failed_frame
+                "ready", "Recovery ready · v1.0.5", "pane", {}, failed_frame
             )
             same_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}, rendered_frame
+                "ready", "Recovery ready · v1.0.5", "pane", {}, rendered_frame
             )
 
         self.assertIsNone(failed_frame)
@@ -1328,13 +1328,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", side_effect=sizes
         ):
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}
+                "ready", "Recovery ready · v1.0.5", "pane", {}
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.5", "pane", {}, frame
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.4", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.5", "pane", {}, frame
             )
 
         self.assertEqual(output.write.call_count, 2)

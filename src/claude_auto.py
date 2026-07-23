@@ -19,7 +19,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
