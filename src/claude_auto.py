@@ -1374,6 +1374,7 @@ def watchdog_main(run_id, display_mode):
     recovery_suppressed = False
     seen = set()
     got_session_end = False
+    lock_blocked = False
     current_state = "ready"
     write_status(run_id, "ready", retry_count=0)
     last_render = 0.0
@@ -1392,8 +1393,10 @@ def watchdog_main(run_id, display_mode):
     next_terminal_poll = time.monotonic()
 
     def handle(event, deferred=False):
-        nonlocal retry_count, retry_updated_at, pending, submission, deferred_failures, recovery_suppressed, got_session_end, current_state, meta, terminal_fallback_at, terminal_fallback_observation, terminal_hook_at, terminal_hook_category, terminal_fired_at, terminal_fired_category
+        nonlocal retry_count, retry_updated_at, pending, submission, deferred_failures, recovery_suppressed, got_session_end, lock_blocked, current_state, meta, terminal_fallback_at, terminal_fallback_observation, terminal_hook_at, terminal_hook_category, terminal_fired_at, terminal_fired_category
         kind = event.get("kind")
+        if kind == "lock_blocked" and event.get("run_id") != run_id:
+            return
         category = event.get("category")
         terminal_source = event.get("source") == "terminal_fallback"
         if (
@@ -1419,6 +1422,8 @@ def watchdog_main(run_id, display_mode):
             log_event(run_id, kind)
             return
         if kind == "lock_blocked":
+            got_session_end = True
+            lock_blocked = True
             current_state = "blocked"
             pending = None
             submission = None
@@ -1891,6 +1896,16 @@ def watchdog_main(run_id, display_mode):
         except FileNotFoundError:
             pass
         cleanup_run(run_id, got_session_end)
+        if lock_blocked:
+            for pane, identity in (
+                (meta.get("main_pane"), meta.get("tmux_identity")),
+                (meta.get("watchdog_pane"), meta.get("watchdog_pane_identity")),
+            ):
+                if pane and tmux_target_alive(pane, identity):
+                    try:
+                        tmux_run(["kill-pane", "-t", pane], capture=True)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
     return 0
 
 
@@ -2092,7 +2107,11 @@ def launch_watchdog(run_id, display_mode, main_pane, cwd):
             ],
             check=True,
         ).stdout.strip()
-        update_meta(run_id, watchdog_pane=watchdog_pane)
+        update_meta(
+            run_id,
+            watchdog_pane=watchdog_pane,
+            watchdog_pane_identity=tmux_target_identity(watchdog_pane),
+        )
         return watchdog_pane
     watchdog = subprocess.Popen(
         [str(PYTHON), str(SCRIPT), "watchdog", run_id, display_mode],

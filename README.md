@@ -56,7 +56,7 @@ Our servers are currently overloaded. Please try again later.
 
 一次 continuation 最多尝试三次 Enter，但仍只计为一次 `Recovery N/3`。状态栏只展示用户层级的 `Submitting recovery N/3`，不暴露内部 Enter 阶段。如果最终仍未确认且 continuation 还在输入框中，状态会提示 `Submit not confirmed · press Enter if recovery remains`；此时只在 recovery 文本仍可见时手动按一次 Enter。其一次性 provenance 在五分钟内仍有效，因此会被识别为同一次自动恢复，而不是新的人工任务。
 
-默认情况下，终端高度至少 16 行时会在受管窗口底部显示一行 tmux pane border 状态，并且文字只出现在精确的受管主 pane 上。如果该窗口已经自定义 `pane-border-status` 或 `pane-border-format`，不会覆盖用户配置，而是退回独立的一行 watchdog pane；终端低于 16 行时隐藏常驻展示，但恢复功能仍继续运行。正常退出和创建失败时都会恢复原有 tmux window option，包括原本的局部设置或继承关系。
+默认情况下，终端高度至少 16 行时会在受管窗口底部显示一行 tmux pane border 状态，并且文字只出现在精确的受管主 pane 上。如果该窗口已经自定义 `pane-border-status` 或 `pane-border-format`，不会覆盖用户配置，而是退回独立的一行 watchdog pane；终端低于 16 行时隐藏常驻展示，但恢复功能仍继续运行。正常退出和创建失败时都会恢复原有 tmux window option，包括原本的局部设置或继承关系。如果同一个 Claude session 已由另一受管 run 持有，后启动的重复 run 会在校验 pane identity 后关闭自己创建的主 pane 和 watchdog pane、释放自己的锁；不会关闭其他窗口或共享 tmux server。
 
 状态示例：
 

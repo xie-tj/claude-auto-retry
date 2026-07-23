@@ -1353,6 +1353,79 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(owner, first)
         self.assertEqual(self.module.get_meta(second)["state"], "blocked")
 
+    def test_watchdog_cleans_up_only_its_run_after_lock_blocked(self):
+        run_id = "c" * 32
+        other_run_id = "d" * 32
+        directory = self.create_run(
+            run_id,
+            session_id="duplicate-session",
+            cancel_binding=False,
+        )
+        other_directory = self.create_run(other_run_id)
+        self.module.update_meta(
+            run_id,
+            main_pane="%blocked",
+            tmux_identity="blocked-pane-identity",
+            watchdog_pane="%watchdog",
+            watchdog_pane_identity="watchdog-pane-identity",
+        )
+        self.assertTrue(
+            self.module.acquire_named_lock("session", "duplicate-session", run_id)[0]
+        )
+        killed_targets = []
+
+        def target_alive(target, expected_identity=None):
+            return (target, expected_identity) in {
+                ("%blocked", "blocked-pane-identity"),
+                ("%watchdog", "watchdog-pane-identity"),
+            }
+
+        def record_tmux(args, **kwargs):
+            if args[0] == "kill-pane":
+                killed_targets.append(args[2])
+            return Result(stdout="")
+
+        with mock.patch.object(
+            self.module, "tmux_target_alive", side_effect=target_alive
+        ), mock.patch.object(
+            self.module, "tmux_run", side_effect=record_tmux
+        ), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ):
+            thread = threading.Thread(
+                target=self.module.watchdog_main,
+                args=(run_id, 0),
+                daemon=True,
+            )
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue((directory / "ready").exists())
+
+            self.module.send_run_event(
+                run_id,
+                self.module.event_record("lock_blocked", other_run_id),
+            )
+            time.sleep(0.35)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(
+                self.module.read_json(directory / "status.json", {}).get("state"),
+                "ready",
+            )
+
+            self.module.send_run_event(
+                run_id,
+                self.module.event_record("lock_blocked", run_id),
+            )
+            thread.join(2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(killed_targets, ["%blocked", "%watchdog"])
+        self.assertFalse(directory.exists())
+        self.assertFalse(self.module.lock_name("session", "duplicate-session").exists())
+        self.assertTrue(other_directory.exists())
+
     def run_hook(self, payload, run_id):
         events = []
         environment = {"CLAUDE_AUTO_RUN_ID": run_id}
