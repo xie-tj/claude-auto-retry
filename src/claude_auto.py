@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -19,7 +20,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -299,14 +300,24 @@ def run_meta_path(run_id):
 
 def update_meta(run_id, **updates):
     directory = run_dir(run_id)
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not directory.is_dir():
+        return {}
     lock_path = directory / "meta.lock"
-    with open(lock_path, "a+") as handle:
+    try:
+        handle = open(lock_path, "a+")
+    except FileNotFoundError:
+        return {}
+    with handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        meta = read_json(directory / "meta.json", {})
+        if not directory.is_dir():
+            return {}
+        meta_path = directory / "meta.json"
+        meta = read_json(meta_path, None)
+        if not isinstance(meta, dict) or not meta:
+            return {}
         meta.update(updates)
         meta["updated_at"] = time.time()
-        atomic_json(directory / "meta.json", meta)
+        atomic_json(meta_path, meta)
     return meta
 
 
@@ -578,6 +589,13 @@ def session_lock_from_hook(run_id, session_id, cwd):
 
 
 def hook_main():
+    """Report recovery observations only.
+
+    Hook JSON and the per-user event socket are deliberately not lifecycle
+    authority.  In particular SessionEnd and lock_blocked may update recovery
+    state, but only pane_run_main observes the direct raw-Claude child and may
+    close an interactive tmux target.
+    """
     if os.environ.get("CLAUDE_AUTO_DISABLED") == "1":
         return 0
     try:
@@ -589,78 +607,67 @@ def hook_main():
         return 0
     session_id = str(payload.get("session_id") or "unknown")
     run_id = os.environ.get("CLAUDE_AUTO_RUN_ID", "")
-    managed = False
     try:
-        directory = run_dir(run_id)
-        managed = directory.exists()
+        managed = run_dir(run_id).exists()
     except ValueError:
-        directory = None
+        managed = False
     if not managed:
         if event_name == "SessionEnd":
             try:
                 (UNMANAGED_DIR / (hashlib.sha256(session_id.encode()).hexdigest() + ".jsonl")).unlink()
             except FileNotFoundError:
                 pass
-            return 0
-        if event_name == "StopFailure":
+        elif event_name == "StopFailure":
             category = classify_failure(payload)
             if category:
-                path = UNMANAGED_DIR / (hashlib.sha256(session_id.encode()).hexdigest() + ".jsonl")
-                append_jsonl(path, event_record("unmanaged_failure", category=category))
+                append_jsonl(
+                    UNMANAGED_DIR / (hashlib.sha256(session_id.encode()).hexdigest() + ".jsonl"),
+                    event_record("unmanaged_failure", category=category),
+                )
         return 0
 
+    agent_id = payload.get("agent_id")
+    subagent = bool(agent_id)
     if event_name == "SessionStart":
-        ok, owner = session_lock_from_hook(run_id, session_id, str(payload.get("cwd") or os.getcwd()))
-        send_run_event(run_id, event_record("session_start", run_id, session_id=session_id, source=payload.get("source")))
+        # Lock ownership is safe state bookkeeping; it has no teardown effect.
+        if subagent or session_id == "unknown":
+            return 0
+        ok, owner = session_lock_from_hook(run_id, session_id, os.getcwd())
+        send_run_event(run_id, event_record("session_start", run_id, session_id=session_id))
         if not ok:
             message = "该 Claude session 已由另一个受管进程使用；请用 claude-auto list/attach 连接已有会话。"
             send_run_event(run_id, event_record("lock_blocked", run_id, session_id=session_id, owner=owner))
             json.dump({"continue": False, "stopReason": message, "suppressOutput": False}, sys.stdout, ensure_ascii=False)
             sys.stdout.write("\n")
         return 0
-
     if event_name == "SessionEnd":
-        send_run_event(run_id, event_record("session_end", run_id, session_id=session_id))
+        send_run_event(run_id, event_record("session_end", run_id, session_id=session_id, subagent=subagent))
         return 0
-
     if event_name == "Stop":
-        send_run_event(run_id, event_record("turn_success", run_id, session_id=session_id))
+        if not subagent:
+            send_run_event(run_id, event_record("turn_success", run_id, session_id=session_id))
         return 0
-
     if event_name == "UserPromptSubmit":
+        if subagent:
+            return 0
         prompt = str(payload.get("prompt") or "")
-        recovery = consume_expected_recovery(run_id, prompt)
-        send_run_event(
-            run_id,
-            event_record("prompt_submit", run_id, session_id=session_id, recovery=recovery),
-        )
+        send_run_event(run_id, event_record("prompt_submit", run_id, session_id=session_id, recovery=consume_expected_recovery(run_id, prompt)))
         return 0
-
     category = classify_failure(payload)
-    agent_id = payload.get("agent_id")
-    if not category:
-        send_run_event(
-            run_id,
-            event_record(
-                "unsupported_failure",
-                run_id,
-                session_id=session_id,
-                prompt_id=payload.get("prompt_id"),
-                subagent=bool(agent_id),
-                agent_id=str(agent_id) if agent_id else None,
-            ),
-        )
-        return 0
+    fields = {
+        "session_id": session_id,
+        "prompt_id": payload.get("prompt_id"),
+        "subagent": subagent,
+        "agent_id": str(agent_id) if agent_id else None,
+    }
+    if category:
+        fields["category"] = category
     send_run_event(
         run_id,
         event_record(
-            "recoverable_failure",
+            "recoverable_failure" if category else "unsupported_failure",
             run_id,
-            session_id=session_id,
-            prompt_id=payload.get("prompt_id"),
-            category=category,
-            subagent=bool(agent_id),
-            agent_id=str(agent_id) if agent_id else None,
+            **fields
         ),
     )
     return 0
@@ -701,6 +708,7 @@ STATUS_PRESENTATION = {
     "blocked": ("!", "[!]", "red"),
     "incompatible": ("!", "[!]", "red"),
     "target_lost": ("!", "[!]", "red"),
+    "end_cleanup_failed": ("!", "[!]", "red"),
 }
 
 
@@ -848,6 +856,7 @@ def status_text(
         "blocked": "Duplicate session · run claude-auto doctor",
         "incompatible": "Compatibility issue · run claude-auto doctor",
         "target_lost": "Target unavailable · run claude-auto doctor",
+        "end_cleanup_failed": "End cleanup failed · run claude-auto cleanup <session>",
         "update_available": "Update installed · restart to update",
         "starting": "Starting auto-recovery…",
     }
@@ -1318,6 +1327,9 @@ def release_tmux_binding(run_id):
 
 
 def cleanup_run(run_id, normal):
+    directory = run_dir(run_id)
+    if not directory.is_dir():
+        return
     try:
         meta = get_meta(run_id)
     except ValueError:
@@ -1422,7 +1434,7 @@ def watchdog_main(run_id, display_mode):
             log_event(run_id, kind)
             return
         if kind == "lock_blocked":
-            got_session_end = True
+            # This is state only.  Datagram contents must never close panes.
             lock_blocked = True
             current_state = "blocked"
             pending = None
@@ -1432,11 +1444,9 @@ def watchdog_main(run_id, display_mode):
             write_status(run_id, current_state, retry_count=retry_count)
             return
         if kind == "session_end":
-            got_session_end = True
-            pending = None
-            submission = None
-            deferred_failures = []
-            log_event(run_id, kind)
+            # A hook cannot prove that it represents the root conversation.
+            # The direct child waiter in pane_run_main owns normal teardown.
+            log_event(run_id, "session_end_observed", subagent=bool(event.get("subagent")))
             return
         if kind == "turn_success":
             completed_recovery = current_state == "awaiting" and retry_count > 0
@@ -1556,8 +1566,6 @@ def watchdog_main(run_id, display_mode):
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
 
-            if got_session_end:
-                break
             if not tmux_target_alive(meta.get("main_pane"), meta.get("tmux_identity")):
                 if pane_dead_since is None:
                     pane_dead_since = time.monotonic()
@@ -1895,17 +1903,11 @@ def watchdog_main(run_id, display_mode):
             socket_path.unlink()
         except FileNotFoundError:
             pass
-        cleanup_run(run_id, got_session_end)
-        if lock_blocked:
-            for pane, identity in (
-                (meta.get("main_pane"), meta.get("tmux_identity")),
-                (meta.get("watchdog_pane"), meta.get("watchdog_pane_identity")),
-            ):
-                if pane and tmux_target_alive(pane, identity):
-                    try:
-                        tmux_run(["kill-pane", "-t", pane], capture=True)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
+        final_meta = get_meta(run_id)
+        # The root wrapper and owner monitor preserve lifecycle state until the
+        # outer launcher confirms the exact tmux target disappeared.
+        if final_meta.get("state") not in {"root_exited", "ending", "end_cleanup_failed"}:
+            cleanup_run(run_id, False)
     return 0
 
 
@@ -1976,6 +1978,7 @@ def start_launch_server(run_id, claude_args):
 
 
 def pane_run_main(run_id):
+    """Run and wait for the root raw Claude process in its own tmux pane."""
     directory = run_dir(run_id)
     try:
         claude_args = receive_launch_spec(run_id)
@@ -1992,7 +1995,60 @@ def pane_run_main(run_id):
     env["CLAUDE_AUTO_RUN_ID"] = run_id
     env["CLAUDE_AUTO_MANAGED"] = "interactive"
     env.pop("CLAUDE_AUTO_DISABLED", None)
-    os.execve(str(RAW_CLAUDE), [str(RAW_CLAUDE)] + claude_args, env)
+    try:
+        root = subprocess.Popen([str(RAW_CLAUDE)] + claude_args, env=env)
+        update_meta(run_id, root_child_pid=root.pid, state="running")
+        code = root.wait()
+    except OSError as exc:
+        print("claude-auto: cannot start raw Claude: {}".format(exc), file=sys.stderr)
+        code = 127
+    except KeyboardInterrupt:
+        try:
+            root.send_signal(signal.SIGINT)
+            code = root.wait(timeout=5)
+        except (UnboundLocalError, OSError, subprocess.TimeoutExpired):
+            code = 130
+    # This process, and only this process, waited for the direct root child.
+    # It records that fact but does not destroy the tmux resource containing
+    # itself; a session-external owner monitor performs the verified close.
+    update_meta(
+        run_id,
+        state="root_exited",
+        root_exited_at=time.time(),
+        root_exit_code=code,
+    )
+    return code
+
+
+def owner_monitor_main(run_id):
+    """Close this run's tagged tmux target after the direct root child exits."""
+    directory = run_dir(run_id)
+    deadline = time.monotonic() + 7 * 24 * 60 * 60
+    while directory.exists() and time.monotonic() < deadline:
+        meta = get_meta(run_id)
+        state = meta.get("state")
+        if state == "root_exited":
+            return 0 if close_ended_owned_target(run_id) else 1
+        if state in {"end_cleanup_failed", "exited", "crashed"}:
+            return 0 if state == "exited" else 1
+        time.sleep(0.05)
+    return 0 if not directory.exists() else 1
+
+
+def launch_owner_monitor(run_id):
+    monitor = subprocess.Popen(
+        [str(PYTHON), str(SCRIPT), "owner-monitor", run_id],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    update_meta(
+        run_id,
+        owner_monitor_pid=monitor.pid,
+        owner_monitor_identity=process_identity(monitor.pid),
+    )
+    return monitor
 
 
 def sanitize_name(value):
@@ -2129,6 +2185,406 @@ def launch_watchdog(run_id, display_mode, main_pane, cwd):
     return None
 
 
+TMUX_OWNER_OPTION = "@claude_auto_owner_tag"
+TMUX_OWNER_NAME_PREFIX = "claude-auto-"
+TMUX_OWNER_NAME_HEX_LENGTH = 48
+
+
+def tmux_server_epoch():
+    """Return a locale-independent tmux server generation marker."""
+    try:
+        result = tmux_run(
+            ["display-message", "-p", "#{pid}\t#{start_time}\t#{socket_path}"],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    fields = (result.stdout or "").rstrip("\n").split("\t")
+    if (
+        result.returncode != 0
+        or len(fields) != 3
+        or not fields[0].isdigit()
+        or not fields[1].isdigit()
+        or not fields[2]
+        or any("\x00" in field for field in fields)
+    ):
+        return None
+    return "\t".join(fields)
+
+
+def tmux_server_epoch_matches(meta):
+    expected = meta.get("tmux_server_epoch")
+    return isinstance(expected, str) and bool(expected) and tmux_server_epoch() == expected
+
+
+def tmux_server_generation_gone(meta):
+    expected = meta.get("tmux_server_epoch")
+    if not isinstance(expected, str):
+        return False
+    fields = expected.split("\t")
+    if len(fields) != 3 or not fields[0].isdigit() or not fields[2]:
+        return False
+    pid = int(fields[0])
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        # tmux can leave its Unix socket path behind after the server exits.
+        # The recorded server PID being gone is sufficient to prove that this
+        # generation, and therefore every resource it owned, has ended.
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def wait_for_tmux_server_generation_gone(meta, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        if tmux_server_generation_gone(meta):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def tmux_owner_target_name(owner_tag):
+    if not isinstance(owner_tag, str) or not re.fullmatch(r"[0-9a-f]{64}", owner_tag):
+        raise ValueError("invalid tmux owner tag")
+    # The name is an unguessable 192-bit prefix; the complete tag is checked in
+    # the tmux user option before any destructive command.
+    return TMUX_OWNER_NAME_PREFIX + owner_tag[:TMUX_OWNER_NAME_HEX_LENGTH]
+
+
+def tmux_owner_bridge_name(owner_tag):
+    return tmux_owner_target_name(owner_tag) + "-bridge"
+
+
+def tmux_exact_session_target(session_name):
+    if not isinstance(session_name, str) or not session_name or ":" in session_name:
+        return None
+    return "=" + session_name
+
+
+def tmux_exact_window_target(session_name, window_name):
+    if (
+        not isinstance(session_name, str) or not session_name or ":" in session_name
+        or not isinstance(window_name, str) or not window_name or ":" in window_name
+    ):
+        return None
+    return "={}:={}".format(session_name, window_name)
+
+
+def owned_window_link_target(meta):
+    if meta.get("owned_target") != "window":
+        return None
+    try:
+        if meta.get("tmux_window_name") != tmux_owner_target_name(meta.get("tmux_owner_tag")):
+            return None
+    except ValueError:
+        return None
+    target = tmux_exact_window_target(meta.get("tmux_host_session_name"), meta.get("tmux_window_name"))
+    return target if target and meta.get("owned_window_link") == target else None
+
+
+def legacy_tmux_metadata(meta):
+    return bool(
+        meta.get("owned_target") in {"session", "window"}
+        and (not meta.get("tmux_owner_tag") or not meta.get("tmux_server_epoch"))
+    )
+
+
+def owned_tmux_target_identity(meta):
+    kind = meta.get("owned_target")
+    session_id = meta.get("tmux_session_id")
+    window_id = meta.get("window_id")
+    owner_tag = meta.get("tmux_owner_tag")
+    target_name = meta.get("tmux_window_name")
+    if kind not in {"session", "window"} or not all(
+        isinstance(value, str) and value for value in (session_id, window_id, owner_tag, target_name)
+    ):
+        return None
+    try:
+        if target_name != tmux_owner_target_name(owner_tag):
+            return None
+    except ValueError:
+        return None
+    if kind == "session":
+        session_name = meta.get("tmux_session_name")
+        if session_name != target_name or not tmux_exact_session_target(session_name):
+            return None
+        return kind, session_id, window_id, session_name, target_name, owner_tag
+    host = meta.get("tmux_host_session_name")
+    if not owned_window_link_target(meta):
+        return None
+    return kind, session_id, window_id, host, target_name, owner_tag
+
+
+def parse_tmux_records(result, fields, optional_empty_fields=()):
+    """Parse an all-object listing without rejecting unrelated empty tags."""
+    if result.returncode != 0:
+        return None
+    optional = set(optional_empty_fields)
+    if any(not isinstance(index, int) or index < 0 or index >= fields for index in optional):
+        return None
+    records = set()
+    for line in (result.stdout or "").splitlines():
+        record = tuple(line.split("\t"))
+        if len(record) != fields or any(not value for index, value in enumerate(record) if index not in optional):
+            return None
+        records.add(record)
+    return records
+
+
+def owned_tmux_target_presence(meta):
+    """Return True, False, or None for exactly this tagged generation."""
+    expected = owned_tmux_target_identity(meta)
+    if not expected or not tmux_server_epoch_matches(meta):
+        return None
+    kind, session_id, window_id, session_name, window_name, owner_tag = expected
+    try:
+        result = tmux_run(
+            ["list-windows", "-a", "-F", "#{session_id}\t#{window_id}\t#{session_name}\t#{window_name}\t#{" + TMUX_OWNER_OPTION + "}"],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    windows = parse_tmux_records(result, 5, optional_empty_fields=(4,))
+    if windows is None:
+        return None
+    exact_window = (session_id, window_id, session_name, window_name, owner_tag)
+    stable_windows = [record for record in windows if record[:2] == exact_window[:2]]
+    if kind == "window":
+        return True if exact_window in windows else (None if stable_windows else False)
+    try:
+        result = tmux_run(
+            ["list-sessions", "-F", "#{session_id}\t#{session_name}\t#{" + TMUX_OWNER_OPTION + "}"],
+            capture=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    sessions = parse_tmux_records(result, 3, optional_empty_fields=(2,))
+    if sessions is None:
+        return None
+    exact_session = (session_id, session_name, owner_tag)
+    stable_sessions = [record for record in sessions if record[0] == session_id]
+    if exact_session in sessions and exact_window in windows:
+        return True
+    return None if stable_sessions or stable_windows else False
+
+
+def mark_owned_tmux_close_failure(run_id, reason="close_failed"):
+    meta = get_meta(run_id)
+    update_meta(
+        run_id,
+        state="end_cleanup_failed",
+        end_close_attempts=int(meta.get("end_close_attempts") or 0),
+        end_close_failed_at=time.time(),
+        end_close_failure=reason,
+    )
+    write_status(run_id, "end_cleanup_failed", retry_count=0)
+
+
+def unlink_owned_tmux_window(meta, target):
+    """Remove one session link without destroying links in other sessions."""
+    bridge_name = tmux_owner_bridge_name(meta.get("tmux_owner_tag"))
+    created = False
+    unlinked = False
+    bridge_closed = False
+    try:
+        result = tmux_run(
+            [
+                "new-session", "-d", "-P", "-F", "#{session_id}",
+                "-s", bridge_name, "-n", "placeholder", "sleep 5",
+            ],
+            capture=True,
+        )
+        bridge_id = (result.stdout or "").strip()
+        if result.returncode != 0 or not re.fullmatch(r"\$[0-9]+", bridge_id):
+            return False
+        created = True
+        if tmux_run(
+            ["set-option", "-t", bridge_id, TMUX_OWNER_OPTION, meta.get("tmux_owner_tag")],
+            capture=True,
+        ).returncode != 0:
+            return False
+        if tmux_run(
+            ["link-window", "-s", target, "-t", bridge_id + ":"],
+            capture=True,
+        ).returncode != 0:
+            return False
+        unlinked = tmux_run(
+            ["unlink-window", "-t", target], capture=True
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        if created:
+            try:
+                bridge_closed = tmux_run(
+                    ["kill-session", "-t", bridge_id], capture=True
+                ).returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                bridge_closed = False
+    return unlinked and bridge_closed
+
+
+def close_owned_tmux_target(meta):
+    """Destroy one pre-verified exact target, never a resolver fallback."""
+    expected = owned_tmux_target_identity(meta)
+    if not expected or owned_tmux_target_presence(meta) is not True:
+        return False
+    if expected[0] == "session":
+        target = tmux_exact_session_target(expected[3])
+        command = ["kill-session", "-t", target] if target else None
+        if not command:
+            return False
+        try:
+            return tmux_run(command, capture=True).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    target = owned_window_link_target(meta)
+    return bool(target) and unlink_owned_tmux_window(meta, target)
+
+
+def close_ended_owned_target(run_id):
+    """The external owner monitor performs normal interactive teardown."""
+    meta = dict(get_meta(run_id))
+    presence = owned_tmux_target_presence(meta)
+    if presence is False:
+        update_meta(run_id, state="ending", ending_at=time.time(), target_disappeared=True)
+        return True
+    if (
+        presence is None
+        and meta.get("state") == "root_exited"
+        and meta.get("owned_target") == "session"
+        and wait_for_tmux_server_generation_gone(meta)
+    ):
+        update_meta(
+            run_id,
+            state="ending",
+            ending_at=time.time(),
+            target_disappeared=True,
+            end_close_succeeded=True,
+            end_close_generation=meta.get("tmux_server_epoch"),
+        )
+        return True
+    if presence is not True:
+        mark_owned_tmux_close_failure(
+            run_id, "legacy_metadata_refused" if legacy_tmux_metadata(meta) else "target_unverified"
+        )
+        return False
+    attempts = int(meta.get("end_close_attempts") or 0) + 1
+    update_meta(
+        run_id,
+        state="ending",
+        ending_at=time.time(),
+        end_close_attempts=attempts,
+        end_close_started_generation=meta.get("tmux_server_epoch"),
+    )
+    if not close_owned_tmux_target(meta):
+        mark_owned_tmux_close_failure(run_id, "close_command_failed")
+        return False
+    # A standalone kill can take down the entire tmux server immediately after
+    # this exact command.  The recorded matching generation makes that success
+    # usable by the outer launcher without probing a newly started server.
+    update_meta(
+        run_id,
+        state="ending",
+        end_close_succeeded=True,
+        end_close_generation=meta.get("tmux_server_epoch"),
+        end_close_succeeded_at=time.time(),
+    )
+    return True
+
+
+def successful_final_session_close(meta):
+    if meta.get("owned_target") != "session":
+        return False
+    generation = meta.get("tmux_server_epoch")
+    if meta.get("end_close_succeeded") is True:
+        return meta.get("end_close_generation") == generation
+    return (
+        meta.get("state") == "ending"
+        and meta.get("end_close_started_generation") == generation
+        and tmux_server_generation_gone(meta)
+    )
+
+
+def observe_owned_target_disappearance(run_id, wait=False, outcome=None):
+    """Let the outer launcher clean state only after exact disappearance."""
+    deadline = None if wait else time.monotonic() + 3
+    owner_transition_deadline = None
+    while True:
+        directory = run_dir(run_id)
+        if not directory.exists():
+            return True
+        meta = get_meta(run_id)
+        presence = owned_tmux_target_presence(meta)
+        if presence is False or (presence is None and successful_final_session_close(meta)):
+            if outcome is not None:
+                outcome["root_exit_code"] = meta.get("root_exit_code")
+            cleanup_run(run_id, True)
+            return True
+        state = meta.get("state")
+        if state == "end_cleanup_failed":
+            return False
+        now = time.monotonic()
+        if state in {"root_exited", "ending"}:
+            if owner_transition_deadline is None:
+                owner_transition_deadline = now + 3
+            if now >= owner_transition_deadline:
+                mark_owned_tmux_close_failure(run_id, "owner_monitor_timeout")
+                return False
+            # The external owner monitor may be between observing the root
+            # exit, closing the exact target, and persisting its result.
+            time.sleep(0.05)
+            continue
+        if presence is None:
+            mark_owned_tmux_close_failure(
+                run_id, "legacy_metadata_refused" if legacy_tmux_metadata(meta) else "target_unverified"
+            )
+            return False
+        if deadline is not None and now >= deadline:
+            # An attach/detach is not authority to close a still-live session.
+            return None
+        time.sleep(0.1)
+
+
+def finish_owned_tmux_target(run_id):
+    """Explicit public retry for a retained failed close, never IPC-driven."""
+    if not run_dir(run_id).exists():
+        return True
+    meta = dict(get_meta(run_id))
+    presence = owned_tmux_target_presence(meta)
+    if presence is False:
+        cleanup_run(run_id, True)
+        return True
+    if presence is not True:
+        mark_owned_tmux_close_failure(
+            run_id, "legacy_metadata_refused" if legacy_tmux_metadata(meta) else "target_unverified"
+        )
+        return False
+    update_meta(
+        run_id,
+        state="ending",
+        ending_at=time.time(),
+        end_close_attempts=int(meta.get("end_close_attempts") or 0) + 1,
+    )
+    if not close_owned_tmux_target(meta):
+        mark_owned_tmux_close_failure(run_id, "close_command_failed")
+        return False
+    update_meta(
+        run_id,
+        end_close_succeeded=True,
+        end_close_generation=meta.get("tmux_server_epoch"),
+    )
+    observed = observe_owned_target_disappearance(run_id, wait=False)
+    if observed is True:
+        return True
+    mark_owned_tmux_close_failure(run_id, "target_still_present")
+    return False
+
+
 def attach_managed_session(run_id, tmux_session):
     try:
         return tmux_run(
@@ -2165,8 +2621,10 @@ def interactive_main(args, lifecycle=None):
     project_name = sanitize_name(Path(cwd).name or "home")
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     requested = os.environ.pop("CLAUDE_AUTO_NAME", None)
-    base_name = sanitize_name(requested) if requested else "{}-{}".format(project_name, timestamp)
-    tmux_name = unique_tmux_name(base_name)
+    display_name = sanitize_name(requested) if requested else "{}-{}".format(project_name, timestamp)
+    display_name = unique_tmux_name(display_name)
+    owner_tag = secrets.token_hex(32)
+    owner_name = tmux_owner_target_name(owner_tag)
     directory = run_dir(run_id)
     directory.mkdir(parents=True, mode=0o700)
     ok, reason, project_lock = acquire_initial_locks(run_id, session_id, needs_resolution, cwd)
@@ -2175,24 +2633,26 @@ def interactive_main(args, lifecycle=None):
         lifecycle.close()
         print("claude-auto: {}".format(reason), file=sys.stderr)
         return 73
-    meta = {
-        "version": VERSION,
-        "run_id": run_id,
-        "name": tmux_name,
-        "mode": "interactive",
-        "cwd": cwd,
-        "session_id": session_id,
-        "project_lock": project_lock,
-        "state": "starting",
-        "created_at": time.time(),
-        "supervisor_pid": os.getpid(),
-        "supervisor_identity": process_identity(os.getpid()),
-    }
-    atomic_json(directory / "meta.json", meta)
+    atomic_json(
+        directory / "meta.json",
+        {
+            "version": VERSION,
+            "run_id": run_id,
+            "name": display_name,
+            "mode": "interactive",
+            "cwd": cwd,
+            "session_id": session_id,
+            "project_lock": project_lock,
+            "state": "starting",
+            "created_at": time.time(),
+            "supervisor_pid": os.getpid(),
+            "supervisor_identity": process_identity(os.getpid()),
+        },
+    )
     lifecycle.close()
     columns, lines = shutil.get_terminal_size((100, 24))
     inside_tmux = bool(os.environ.get("TMUX"))
-    created_tmux_session = None
+    created_session = None
     created_window = None
     launch_server = None
     launch_done = None
@@ -2200,45 +2660,82 @@ def interactive_main(args, lifecycle=None):
         launch_server, launch_done = start_launch_server(run_id, args)
         pane_command = shlex.join([str(PYTHON), str(SCRIPT), "pane-run", run_id])
         if inside_tmux:
-            current_session = tmux_run(["display-message", "-p", "#{session_name}"], check=True).stdout.strip()
+            host_session = tmux_run(["display-message", "-p", "#{session_name}"], check=True).stdout.strip()
+            host_target = tmux_exact_session_target(host_session)
+            if not host_target:
+                raise OSError("invalid exact host tmux target")
             created = tmux_run(
-                ["new-window", "-d", "-P", "-F", "#{pane_id} #{window_id}", "-t", current_session,
-                 "-n", tmux_name, "-c", cwd, pane_command],
+                ["new-window", "-d", "-P", "-F", "#{pane_id} #{window_id}", "-t", host_target,
+                 "-n", owner_name, "-c", cwd, pane_command],
                 check=True,
             ).stdout.strip().split()
             main_pane, window_id = created[0], created[1]
-            tmux_session = current_session
-            created_window = "{}:{}".format(tmux_session, window_id)
+            tmux_session = host_session
+            created_window = tmux_exact_window_target(host_session, owner_name)
+            if not created_window:
+                raise OSError("invalid exact nested tmux target")
         else:
-            tmux_run(
-                ["new-session", "-d", "-s", tmux_name, "-x", str(columns), "-y", str(lines),
-                 "-c", cwd, pane_command],
+            created = tmux_run(
+                ["new-session", "-d", "-P", "-F", "#{pane_id} #{window_id}", "-s", owner_name, "-n", owner_name,
+                 "-x", str(columns), "-y", str(lines), "-c", cwd, pane_command],
                 check=True,
-            )
-            created_tmux_session = tmux_name
-            main_pane = tmux_run(["display-message", "-p", "-t", tmux_name + ":0.0", "#{pane_id}"], check=True).stdout.strip()
-            window_id = tmux_run(["display-message", "-p", "-t", main_pane, "#{window_id}"], check=True).stdout.strip()
-            tmux_session = tmux_name
+            ).stdout.strip().split()
+            main_pane, window_id = created[0], created[1]
+            created_session = owner_name
+            tmux_session = owner_name
+        tmux_session_id = tmux_run(["display-message", "-p", "-t", main_pane, "#{session_id}"], check=True).stdout.strip()
+        epoch = tmux_server_epoch()
+        if not tmux_session_id or not epoch:
+            raise OSError("tmux did not report stable ownership identity")
+        if inside_tmux:
+            tmux_run(["set-option", "-w", "-t", window_id, TMUX_OWNER_OPTION, owner_tag], check=True)
+            tmux_run(["set-option", "-w", "-t", window_id, "remain-on-exit", "on"], check=True)
+        else:
+            tmux_run(["set-option", "-t", tmux_session_id, TMUX_OWNER_OPTION, owner_tag], check=True)
+            tmux_run(["set-option", "-w", "-t", window_id, TMUX_OWNER_OPTION, owner_tag], check=True)
         binding = ensure_cancel_binding()
         update_meta(
             run_id,
             main_pane=main_pane,
             window_id=window_id,
             tmux_session=tmux_session,
+            tmux_session_name=tmux_session,
+            tmux_host_session_name=host_session if inside_tmux else None,
+            tmux_window_name=owner_name,
+            tmux_owner_tag=owner_tag,
+            tmux_server_epoch=epoch,
+            tmux_session_id=tmux_session_id,
             tmux_identity=tmux_target_identity(main_pane),
+            owned_target="window" if inside_tmux else "session",
+            owned_window_link=created_window if inside_tmux else None,
             cancel_binding=binding,
         )
         display_mode = prepare_watchdog_display(run_id, lines)
         update_meta(run_id, watchdog_display=display_mode)
         launch_watchdog(run_id, display_mode, main_pane, cwd)
+        launch_owner_monitor(run_id)
         tmux_run(["select-pane", "-t", main_pane], capture=True)
         if not launch_done.wait(timeout=15):
             raise TimeoutError("launch specification was not consumed")
         if inside_tmux:
-            tmux_run(["select-window", "-t", "{}:{}".format(tmux_session, window_id)], capture=True)
-            return 0
-        return attach_managed_session(run_id, tmux_session)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, TimeoutError, OSError) as exc:
+            tmux_run(["select-window", "-t", created_window], capture=True)
+            outcome = {}
+            observed = observe_owned_target_disappearance(run_id, wait=True, outcome=outcome)
+            if not observed:
+                return 1
+            root_code = outcome.get("root_exit_code")
+            return root_code if isinstance(root_code, int) else 0
+        attach_code = attach_managed_session(run_id, tmux_session)
+        outcome = {}
+        observed = observe_owned_target_disappearance(run_id, wait=False, outcome=outcome)
+        if observed is False:
+            return 1
+        if observed is True:
+            root_code = outcome.get("root_exit_code")
+            if isinstance(root_code, int):
+                return root_code
+        return attach_code
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, TimeoutError, OSError, IndexError) as exc:
         if launch_server is not None:
             try:
                 launch_server.close()
@@ -2248,10 +2745,12 @@ def interactive_main(args, lifecycle=None):
             ipc_socket_path(run_id, "launch").unlink()
         except FileNotFoundError:
             pass
-        if created_tmux_session:
-            tmux_run(["kill-session", "-t", "=" + created_tmux_session], capture=True)
+        # Setup failure is not normal lifecycle teardown.  The only possible
+        # targets here are the freshly generated exact owner names.
+        if created_session:
+            tmux_run(["kill-session", "-t", tmux_exact_session_target(created_session)], capture=True)
         elif created_window:
-            tmux_run(["kill-window", "-t", created_window], capture=True)
+            unlink_owned_tmux_window({"tmux_owner_tag": owner_tag}, created_window)
         print("claude-auto: failed to create managed tmux session: {}".format(exc), file=sys.stderr)
         cleanup_run(run_id, False)
         return 1
@@ -2743,7 +3242,16 @@ def cleanup_stale(force=False):
             except FileNotFoundError:
                 continue
             meta = read_json(path / "meta.json", {}) if path.is_dir() else {}
-            if parent == RUNS_DIR and path.is_dir():
+            if parent == RUNS_DIR and path.is_dir() and re.fullmatch(r"[0-9a-f]{32}", path.name):
+                if meta.get("state") in {"ending", "end_cleanup_failed"}:
+                    presence = owned_tmux_target_presence(meta)
+                    if presence is False or (presence is None and successful_final_session_close(meta)):
+                        cleanup_run(path.name, True)
+                    else:
+                        # Legacy, ambiguous, and failed tagged records stay
+                        # visible for explicit public cleanup, even with clean.
+                        continue
+                    continue
                 if run_is_live(path.name, meta):
                     continue
                 release_named_lock("session", meta.get("session_id"), path.name)
@@ -2791,7 +3299,7 @@ def find_run(name):
 SESSION_STATE_GROUPS = {
     "error": {
         "unconfirmed", "stale", "exhausted", "unsupported", "blocked",
-        "incompatible", "target_lost", "crashed",
+        "incompatible", "target_lost", "crashed", "end_cleanup_failed",
     },
     "active": {"countdown", "submitting", "awaiting"},
     "update": {"update_available"},
@@ -2841,7 +3349,7 @@ def session_diagnostics():
         if not path.is_dir():
             continue
         meta = read_json(path / "meta.json", {})
-        if not run_is_live(path.name, meta):
+        if meta.get("state") != "end_cleanup_failed" and not run_is_live(path.name, meta):
             continue
         status = read_json(path / "status.json", {})
         state = status.get("state", meta.get("status", "running"))
@@ -2959,6 +3467,23 @@ def skip_run(name):
 
 def cancel_run(name):
     return skip_run(name)
+
+
+def retry_owned_cleanup(name):
+    """Retry only a retained tagged target through explicit user action."""
+    run_id, meta = find_run(name)
+    if meta.get("state") != "end_cleanup_failed":
+        print("No retained end-cleanup failure for {}.".format(meta.get("name", name)), file=sys.stderr)
+        return 1
+    if finish_owned_tmux_target(run_id):
+        print("Cleaned up {}.".format(meta.get("name", name)))
+        return 0
+    failure = get_meta(run_id).get("end_close_failure", "target_unverified")
+    if failure == "legacy_metadata_refused":
+        print("Cleanup for {} is refused: legacy metadata has no owner tag or tmux server generation; inspect and close it manually.".format(meta.get("name", name)), file=sys.stderr)
+    else:
+        print("Cleanup for {} was not retried safely ({}); retained for inspection.".format(meta.get("name", name), failure), file=sys.stderr)
+    return 1
 
 
 def cancel_target(session_name, window_id):
@@ -3354,6 +3879,8 @@ def management_main(args, lifecycle=None):
     skip.add_argument("name")
     cancel = subparsers.add_parser("cancel")
     cancel.add_argument("name")
+    cleanup = subparsers.add_parser("cleanup")
+    cleanup.add_argument("name")
     logs = subparsers.add_parser("logs")
     logs.add_argument("name")
     subparsers.add_parser("status")
@@ -3378,6 +3905,8 @@ def management_main(args, lifecycle=None):
         return set_pause(ns.name, False)
     if ns.command in {"skip", "cancel"}:
         return skip_run(ns.name)
+    if ns.command == "cleanup":
+        return retry_owned_cleanup(ns.name)
     if ns.command == "logs":
         return show_logs(ns.name)
     if ns.command == "doctor":
@@ -3400,7 +3929,14 @@ def management_main(args, lifecycle=None):
     return 2
 
 
+def clear_inherited_managed_environment():
+    """A shim invocation is distinct from the root wrapper that spawned it."""
+    for name in ("CLAUDE_AUTO_RUN_ID", "CLAUDE_AUTO_MANAGED"):
+        os.environ.pop(name, None)
+
+
 def shim_main(args):
+    clear_inherited_managed_environment()
     lifecycle = lifecycle_lock()
     if not SCRIPT.exists():
         lifecycle.close()
@@ -3440,6 +3976,8 @@ def main():
         return watchdog_main(sys.argv[2], sys.argv[3])
     if len(sys.argv) >= 3 and sys.argv[1] == "pane-run":
         return pane_run_main(sys.argv[2])
+    if len(sys.argv) >= 3 and sys.argv[1] == "owner-monitor":
+        return owner_monitor_main(sys.argv[2])
     if len(sys.argv) >= 4 and sys.argv[1] == "cancel-target":
         return cancel_target(sys.argv[2], sys.argv[3])
     if len(sys.argv) >= 2 and sys.argv[1] == "install-report-active":

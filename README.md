@@ -36,7 +36,7 @@ Our servers are currently overloaded. Please try again later.
 - 十分钟没有连续故障后重置恢复计数。
 - 不会自动添加 `--dangerously-skip-permissions` 或提升权限。
 - 支持交互式终端、`claude -p`、JSON 和 `stream-json` 输出。
-- 支持全局/单会话暂停、跳过倒计时、查看风险排序状态、清理和完整卸载。
+- 支持全局/单会话暂停、跳过倒计时、查看风险排序状态、清理和完整卸载；若结束清理因 tmux 不确定性失败，会保留为可见的 `end_cleanup_failed` 状态，并可用显式安全重试处理。
 - 单行状态展示使用形状、文字和语义颜色，并自动适配窄终端、`NO_COLOR`、`TERM=dumb` 与非 UTF-8 输出。
 - 日志只保存时间、错误类别、恢复次数和动作，不保存 prompt、回复、工具输出、源码或完整错误文本。
 
@@ -56,12 +56,12 @@ Our servers are currently overloaded. Please try again later.
 
 一次 continuation 最多尝试三次 Enter，但仍只计为一次 `Recovery N/3`。状态栏只展示用户层级的 `Submitting recovery N/3`，不暴露内部 Enter 阶段。如果最终仍未确认且 continuation 还在输入框中，状态会提示 `Submit not confirmed · press Enter if recovery remains`；此时只在 recovery 文本仍可见时手动按一次 Enter。其一次性 provenance 在五分钟内仍有效，因此会被识别为同一次自动恢复，而不是新的人工任务。
 
-默认情况下，终端高度至少 16 行时会在受管窗口底部显示一行 tmux pane border 状态，并且文字只出现在精确的受管主 pane 上。如果该窗口已经自定义 `pane-border-status` 或 `pane-border-format`，不会覆盖用户配置，而是退回独立的一行 watchdog pane；终端低于 16 行时隐藏常驻展示，但恢复功能仍继续运行。正常退出和创建失败时都会恢复原有 tmux window option，包括原本的局部设置或继承关系。如果同一个 Claude session 已由另一受管 run 持有，后启动的重复 run 会在校验 pane identity 后关闭自己创建的主 pane 和 watchdog pane、释放自己的锁；不会关闭其他窗口或共享 tmux server。
+默认情况下，终端高度至少 16 行时会在受管窗口底部显示一行 tmux pane border 状态，并且文字只出现在精确的受管主 pane 上。如果该窗口已经自定义 `pane-border-status` 或 `pane-border-format`，不会覆盖用户配置，而是退回独立的一行 watchdog pane；终端低于 16 行时隐藏常驻展示，但恢复功能仍继续运行。正常退出和创建失败时都会恢复原有 tmux window option，包括原本的局部设置或继承关系。如果同一个 Claude session 已由另一受管 run 持有，后启动的重复 run 只标记自己的锁和状态；它不会根据 `lock_blocked` 事件杀死任何 pane 或窗口。
 
 状态示例：
 
 ```text
-● Recovery ready · v1.0.5
+● Recovery ready · v1.0.6
 ◔ Service overloaded · recovery 1/3 in 14s · C-b X skip
 ● Submitting recovery 1/3
 ● Recovery 1/3 active
@@ -214,6 +214,14 @@ claude-auto resume <session-name>
 claude-auto clean
 ```
 
+如果 `claude-auto list` 或 `claude-auto doctor` 显示 `end_cleanup_failed`，tmux 的对象标识、owner tag 或 server generation 未能安全确认，状态和锁会被保留而不会误删其他会话。目标已确认消失时会自动释放；否则可显式进行一次受限重试：
+
+```bash
+claude-auto cleanup <session-name>
+```
+
+该命令只会枚举并操作记录的 owner-tag 资源。存在歧义、tmux server 重启或 tag 不匹配时返回非零并继续保留状态，供检查而不是强制删除。缺少 owner tag 和 server generation 的旧版 metadata 永远不会自动 kill/unlink；`cleanup` 会明确拒绝并要求手动检查和关闭。
+
 ## 直接运行官方 Claude Code
 
 如果需要完全绕过自动恢复层：
@@ -293,6 +301,14 @@ API Error: 422
 - 子代理的 timeout/stream error/overloaded：交给父 Claude 处理失败或部分结果。
 - Ctrl-C 或用户主动取消。交互式受管会话中断 attach 时，如果恢复仍在倒计时，watchdog 会跳过这一次恢复；如果首次 Enter 已发送，则只停止后续补按，不会声称能撤回已经提交的 continuation。
 
+  交互式 tmux 资源的正常结束只有一条可信生命周期路径：`pane-run` wrapper 直接启动并 `wait` 官方 raw Claude 根进程。该直接子进程返回即表示根对话结束；wrapper 只写入 `root_exited`，由目标 session/window 外部启动的 owner monitor 校验本 run 的 owner-tagged 资源后执行精确 close。嵌套 Claude、子代理和它们的 Hook 从不返回这个 wrapper，因此不能触发父 run 的 teardown。
+
+  `SessionEnd`、`lock_blocked`、普通 IPC datagram 和任何同 UID 可读取的数据都只是观察/恢复状态，绝不授权 `kill-session` 或 `unlink-window`。IPC 目录的权限防止其他用户写入，但同一 Unix UID 仍应被视为可伪造输入的边界；销毁权限来自 wrapper 对直接子进程退出的本地观察以及外部 owner monitor 对 owner tag 的验证，而不是 socket 字段、session ID 或 secret。
+
+  创建 tmux 资源时 launcher 会生成随机 owner tag，写入专用 session/window 的 tmux user option，并使用由 tag 派生的 exact name。它还记录 tmux server generation 与稳定 session/window ID；关闭前会全量枚举这些字段和 owner option。缺失的 `<session-id>:<window-id>` 永远不会交给可能回退到当前窗口的 target resolver。独立 session 只以 exact owner name `kill-session`。嵌套模式会给新建的受管窗口局部启用 `remain-on-exit`，并通过临时 owner-tagged bridge session 只对记录的 exact host link 执行不带 `-k` 的 `unlink-window`；因此仍链接到其他 session 的窗口保持不变，也不会使用全局 `kill-window` 或会销毁所有 link 的 `unlink-window -k`。
+
+  外层 launcher 在正常结束时轮询该精确 target，并允许 owner monitor 完成验证和记录；确认消失后才调用 `cleanup_run` 并返回根 Claude 的退出码。最终独立 session 的 server 结束后可能留下 stale Unix socket，成功确认以记录的 server PID 已退出为准；若 PID 仍存在或已复用，仍按不确定状态拒绝清理。查询歧义或 close 失败会保留 `end_cleanup_failed`，并可运行 `claude-auto cleanup <session-name>` 进行显式安全重试。嵌套模式同样只轮询精确 target；detach、客户端离开或 Hook 事件不会关闭仍在运行的对话。
+
 ## 升级
 
 重新运行最新安装器即可；安装过程是幂等的，不会重复添加 Hooks 或 PATH 块：
@@ -359,7 +375,7 @@ claude-auto uninstall
 - 完整 API 错误
 - MCP JSON、启动参数或凭据
 
-启动参数通过位于当前用户私有 `0700` IPC 目录中的一次性 Unix socket 传递；默认目录为 `/tmp/claude-auto-<uid>`，socket 文件权限为 `0600`，内容不会写入日志。自定义 IPC 目录必须足够短以满足 Unix socket 路径限制，安装器会提前拒绝过长路径。
+启动参数通过位于当前用户私有 `0700` IPC 目录中的一次性 Unix socket 传递；默认目录为 `/tmp/claude-auto-<uid>`，socket 文件权限为 `0600`，内容不会写入日志。该权限边界只隔离其他 Unix 用户，不把同 UID 的 IPC 内容当作销毁 tmux 资源的授权；正常交互式 close 只在直接等待根 raw Claude 子进程的 wrapper 记录退出后，由 session/window 外部的 owner monitor 验证 owner tag 并执行。自定义 IPC 目录必须足够短以满足 Unix socket 路径限制，安装器会提前拒绝过长路径。
 
 正常退出会删除当前 session 日志。异常残留最多保留 24 小时；临时输出文件最多保留 1 小时。
 
@@ -372,7 +388,7 @@ python3 -m py_compile src/claude_auto.py
 python3 -m unittest discover -s tests -t . -v
 ```
 
-测试使用隔离 HOME 和假的 Claude/tmux，不会修改真实用户配置，也不会调用 API。
+测试使用隔离 HOME 和假的 Claude/tmux，不会修改真实用户配置，也不会调用 API。另有 `tests/test_tmux_isolated.py`：它为每次测试创建随机 `tmux -L` server，验证最终独立 session、共享 server、嵌套窗口及跨 session link 的真实退出清理行为，并覆盖 exact owner target 在对象消失后的 fail-closed 行为；未安装 tmux 时自动跳过，绝不接触默认 tmux server。
 
 ## 已知限制
 

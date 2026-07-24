@@ -106,7 +106,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         cases = [
             (
                 self.module.status_text("ready", {"name": "demo"}),
-                "Recovery ready · v1.0.5",
+                "Recovery ready · v1.0.6",
             ),
             (
                 self.module.status_text(
@@ -195,9 +195,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(shortest, "[~] Recovery 1/3 14s")
         self.assertEqual(
             self.module.present_status(
-                "ready", "Recovery ready · v1.0.5", width=80, color=False, unicode=False
+                "ready", "Recovery ready · v1.0.6", width=80, color=False, unicode=False
             ),
-            "[o] Recovery ready | v1.0.5",
+            "[o] Recovery ready | v1.0.6",
         )
         self.assertEqual(
             self.module.present_status(
@@ -285,14 +285,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             side_effect=lambda arguments, **_: calls.append(arguments) or Result(),
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "border", meta
+                "ready", "Recovery ready · v1.0.6", "border", meta
             )
 
         self.assertEqual(
             calls,
             [[
                 "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
             ]],
         )
 
@@ -309,11 +309,11 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module, "tmux_run", side_effect=tmux_run
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "border",
+                "ready", "Recovery ready · v1.0.6", "border",
                 {"window_id": "@7"},
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "border",
+                "ready", "Recovery ready · v1.0.6", "border",
                 {"window_id": "@7"}, failed_frame,
             )
 
@@ -323,7 +323,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             (
                 "border",
                 "@7",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
             ),
         )
         self.assertEqual(len(attempts), 2)
@@ -339,6 +339,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         status_calls = []
         settled = threading.Event()
         unchanged_polls = 0
+        alive = {"value": True}
 
         def tmux_run(arguments, **_):
             if arguments[:5] == [
@@ -357,7 +358,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             return None
 
         with mock.patch.object(
-            self.module, "tmux_target_alive", return_value=True
+            self.module, "tmux_target_alive", side_effect=lambda *_: alive["value"]
         ), mock.patch.object(
             self.module, "terminal_failure_observation",
             side_effect=observe_terminal,
@@ -375,12 +376,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertTrue(
                 settled.wait(2), "watchdog did not complete repeated render cycles"
             )
-            self.module.send_run_event(
-                run_id,
-                self.module.event_record(
-                    "session_end", run_id, session_id="session-1"
-                ),
-            )
+            alive["value"] = False
             thread.join(2)
 
         self.assertFalse(thread.is_alive())
@@ -398,6 +394,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         first_rendered = threading.Event()
         settled = threading.Event()
         unchanged_polls = 0
+        alive = {"value": True}
 
         def tmux_run(arguments, **_):
             if arguments[:5] == [
@@ -418,7 +415,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             return None
 
         with mock.patch.object(
-            self.module, "tmux_target_alive", return_value=True
+            self.module, "tmux_target_alive", side_effect=lambda *_: alive["value"]
         ), mock.patch.object(
             self.module, "terminal_failure_observation",
             side_effect=observe_terminal,
@@ -438,19 +435,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertTrue(
                 settled.wait(2), "paused status did not settle after rendering"
             )
-            self.module.send_run_event(
-                run_id,
-                self.module.event_record(
-                    "session_end", run_id, session_id="session-1"
-                ),
-            )
+            alive["value"] = False
             thread.join(2)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
                 "#[dim]○#[default] Recovery paused globally · claude-auto resume",
             ],
         )
@@ -466,6 +458,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         status_values = []
         settled = threading.Event()
         unchanged_polls = 0
+        alive = {"value": True}
 
         def tmux_run(arguments, **_):
             if arguments[:5] == [
@@ -485,7 +478,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             return None
 
         with mock.patch.object(
-            self.module, "tmux_target_alive", return_value=True
+            self.module, "tmux_target_alive", side_effect=lambda *_: alive["value"]
         ), mock.patch.object(
             self.module, "terminal_failure_observation",
             side_effect=observe_terminal,
@@ -503,20 +496,15 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.assertTrue(
                 settled.wait(2), "successful retry did not settle"
             )
-            self.module.send_run_event(
-                run_id,
-                self.module.event_record(
-                    "session_end", run_id, session_id="session-1"
-                ),
-            )
+            alive["value"] = False
             thread.join(2)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.5",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
             ],
         )
 
@@ -1274,7 +1262,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}
+                "ready", "Recovery ready · v1.0.6", "pane", {}
             )
         rendered = buffer.getvalue()
         self.assertIn("\x1b[36m●\x1b[0m", rendered)
@@ -1293,13 +1281,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             return_value=os.terminal_size((80, 24)),
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}
+                "ready", "Recovery ready · v1.0.6", "pane", {}
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}, failed_frame
+                "ready", "Recovery ready · v1.0.6", "pane", {}, failed_frame
             )
             same_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}, rendered_frame
+                "ready", "Recovery ready · v1.0.6", "pane", {}, rendered_frame
             )
 
         self.assertIsNone(failed_frame)
@@ -1328,13 +1316,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", side_effect=sizes
         ):
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}
+                "ready", "Recovery ready · v1.0.6", "pane", {}
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.6", "pane", {}, frame
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.5", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.6", "pane", {}, frame
             )
 
         self.assertEqual(output.write.call_count, 2)
@@ -1353,14 +1341,10 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(owner, first)
         self.assertEqual(self.module.get_meta(second)["state"], "blocked")
 
-    def test_watchdog_cleans_up_only_its_run_after_lock_blocked(self):
-        run_id = "c" * 32
-        other_run_id = "d" * 32
-        directory = self.create_run(
-            run_id,
-            session_id="duplicate-session",
-            cancel_binding=False,
-        )
+    def test_lock_blocked_only_updates_safe_state_and_never_kills_panes(self):
+        run_id = "a" * 32
+        other_run_id = "b" * 32
+        directory = self.create_run(run_id, session_id="duplicate-session", cancel_binding=False)
         other_directory = self.create_run(other_run_id)
         self.module.update_meta(
             run_id,
@@ -1369,13 +1353,12 @@ class RuntimeSafetyTests(unittest.TestCase):
             watchdog_pane="%watchdog",
             watchdog_pane_identity="watchdog-pane-identity",
         )
-        self.assertTrue(
-            self.module.acquire_named_lock("session", "duplicate-session", run_id)[0]
-        )
+        self.assertTrue(self.module.acquire_named_lock("session", "duplicate-session", run_id)[0])
         killed_targets = []
+        alive = {"value": True}
 
         def target_alive(target, expected_identity=None):
-            return (target, expected_identity) in {
+            return alive["value"] and (target, expected_identity) in {
                 ("%blocked", "blocked-pane-identity"),
                 ("%watchdog", "watchdog-pane-identity"),
             }
@@ -1385,45 +1368,29 @@ class RuntimeSafetyTests(unittest.TestCase):
                 killed_targets.append(args[2])
             return Result(stdout="")
 
-        with mock.patch.object(
-            self.module, "tmux_target_alive", side_effect=target_alive
-        ), mock.patch.object(
+        with mock.patch.object(self.module, "tmux_target_alive", side_effect=target_alive), mock.patch.object(
             self.module, "tmux_run", side_effect=record_tmux
-        ), mock.patch.object(
-            self.module, "render_watchdog_status"
-        ):
-            thread = threading.Thread(
-                target=self.module.watchdog_main,
-                args=(run_id, 0),
-                daemon=True,
-            )
+        ), mock.patch.object(self.module, "render_watchdog_status"):
+            thread = threading.Thread(target=self.module.watchdog_main, args=(run_id, 0), daemon=True)
             thread.start()
             deadline = time.time() + 2
             while not (directory / "ready").exists() and time.time() < deadline:
                 time.sleep(0.01)
             self.assertTrue((directory / "ready").exists())
-
-            self.module.send_run_event(
-                run_id,
-                self.module.event_record("lock_blocked", other_run_id),
-            )
-            time.sleep(0.35)
+            self.module.send_run_event(run_id, self.module.event_record("lock_blocked", run_id))
+            deadline = time.time() + 2
+            while self.module.read_json(directory / "status.json", {}).get("state") != "blocked" and time.time() < deadline:
+                time.sleep(0.01)
             self.assertTrue(thread.is_alive())
-            self.assertEqual(
-                self.module.read_json(directory / "status.json", {}).get("state"),
-                "ready",
-            )
-
-            self.module.send_run_event(
-                run_id,
-                self.module.event_record("lock_blocked", run_id),
-            )
+            self.assertEqual(self.module.read_json(directory / "status.json", {}).get("state"), "blocked")
+            self.assertEqual(killed_targets, [])
+            self.assertTrue(directory.exists())
+            self.assertTrue(self.module.lock_name("session", "duplicate-session").exists())
+            alive["value"] = False
             thread.join(2)
 
         self.assertFalse(thread.is_alive())
-        self.assertEqual(killed_targets, ["%blocked", "%watchdog"])
-        self.assertFalse(directory.exists())
-        self.assertFalse(self.module.lock_name("session", "duplicate-session").exists())
+        self.assertEqual(killed_targets, [])
         self.assertTrue(other_directory.exists())
 
     def run_hook(self, payload, run_id):
@@ -3170,6 +3137,280 @@ class RuntimeSafetyTests(unittest.TestCase):
             alive["value"] = False
             thread.join(2)
             self.assertFalse(thread.is_alive())
+
+
+    def owner_meta(self, run_id, kind="session"):
+        tag = "a" * 64
+        target = self.module.tmux_owner_target_name(tag)
+        return {
+            "run_id": run_id,
+            "name": "owned",
+            "state": "running",
+            "mode": "interactive",
+            "owned_target": kind,
+            "tmux_session_id": "$owner" if kind == "session" else "$host",
+            "tmux_session_name": target if kind == "session" else "host",
+            "tmux_host_session_name": None if kind == "session" else "host",
+            "window_id": "@owned",
+            "tmux_window_name": target,
+            "tmux_owner_tag": tag,
+            "tmux_server_epoch": "7\t8\t/socket",
+            "owned_window_link": None if kind == "session" else "=host:=" + target,
+        }
+
+    def test_headless_recovery_relaunches_without_interactive_lifecycle_secrets(self):
+        run_id = "9" * 32
+        session_id = "00000000-0000-4000-8000-000000000009"
+        attempts = []
+        failure = {
+            "kind": "recoverable_failure",
+            "at": time.time(),
+            "run_id": run_id,
+            "session_id": session_id,
+            "prompt_id": "prompt-1",
+            "category": "timeout",
+            "subagent": False,
+        }
+
+        def run_attempt(args, *_):
+            attempts.append(list(args))
+            return (1, [failure], None, None) if len(attempts) == 1 else (0, [], None, None)
+
+        with mock.patch.object(self.module, "add_managed_session_id", return_value=(["-p"], session_id, False)), mock.patch.object(
+            self.module.uuid, "uuid4", return_value=mock.Mock(hex=run_id)
+        ), mock.patch.object(self.module, "run_headless_attempt", side_effect=run_attempt), mock.patch.dict(
+            self.module.ERROR_POLICIES,
+            {"timeout": {"delays": (0, 0, 0), "label": "请求超时"}},
+            clear=False,
+        ):
+            self.assertEqual(self.module.headless_main(["-p"], lifecycle=mock.Mock()), 0)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("--resume", attempts[1])
+        self.assertNotIn("CLAUDE_AUTO_ROOT_CAPABILITY", self.module.get_meta(run_id))
+
+    def test_pane_root_child_exit_records_exit_for_owner_monitor(self):
+        run_id = "1" * 32
+        directory = self.create_run(run_id)
+        (directory / "ready").touch()
+
+        class Root:
+            pid = 4242
+
+            def wait(self, timeout=None):
+                return 0
+
+        with mock.patch.object(self.module, "receive_launch_spec", return_value=["--model", "test"]), mock.patch.object(
+            self.module.subprocess, "Popen", return_value=Root()
+        ) as popen, mock.patch.object(self.module, "close_ended_owned_target") as close:
+            self.assertEqual(self.module.pane_run_main(run_id), 0)
+
+        self.assertEqual(popen.call_args.args[0][0], str(self.module.RAW_CLAUDE))
+        close.assert_not_called()
+        meta = self.module.get_meta(run_id)
+        self.assertEqual(meta["state"], "root_exited")
+        self.assertEqual(meta["root_exit_code"], 0)
+
+    def test_owner_monitor_closes_after_direct_root_exit(self):
+        run_id = "b" * 32
+        self.create_run(run_id, state="root_exited", root_exit_code=0)
+        with mock.patch.object(
+            self.module, "close_ended_owned_target", return_value=True
+        ) as close:
+            self.assertEqual(self.module.owner_monitor_main(run_id), 0)
+        close.assert_called_once_with(run_id)
+
+    def test_finished_tmux_generation_accepts_a_stale_socket_path(self):
+        meta = {"tmux_server_epoch": "4242\t100\t/tmp/stale-tmux.sock"}
+        with mock.patch.object(
+            self.module.os, "kill", side_effect=ProcessLookupError
+        ), mock.patch.object(self.module.Path, "exists", return_value=True) as exists:
+            self.assertTrue(self.module.tmux_server_generation_gone(meta))
+        exists.assert_not_called()
+
+    def test_late_updates_never_recreate_a_cleaned_run(self):
+        run_id = "c" * 32
+        directory = self.create_run(run_id)
+        shutil.rmtree(directory)
+
+        self.assertEqual(self.module.update_meta(run_id, state="crashed"), {})
+        self.module.cleanup_run(run_id, False)
+
+        self.assertFalse(directory.exists())
+
+    def test_nested_and_forged_ipc_never_authorize_teardown(self):
+        run_id = "2" * 32
+        directory = self.create_run(run_id, main_pane="%owned", tmux_identity="pane")
+        alive = {"value": True}
+        close = mock.Mock(return_value=True)
+        with mock.patch.object(
+            self.module, "tmux_target_alive", side_effect=lambda *_: alive["value"]
+        ), mock.patch.object(self.module, "close_ended_owned_target", close), mock.patch.object(
+            self.module, "render_watchdog_status"
+        ):
+            thread = threading.Thread(target=self.module.watchdog_main, args=(run_id, "hidden"), daemon=True)
+            thread.start()
+            deadline = time.time() + 2
+            while not (directory / "ready").exists() and time.time() < deadline:
+                time.sleep(0.01)
+            for event in (
+                self.module.event_record("session_end", run_id, session_id="nested", subagent=True),
+                self.module.event_record("session_end", run_id, session_id="forged"),
+                self.module.event_record("lock_blocked", run_id, owner="forged"),
+                self.module.event_record("session_end", run_id, source="owner_lifecycle", owner_verified=True),
+                self.module.event_record("session_end", run_id, source="root_hook", capability="readable"),
+            ):
+                self.module.send_run_event(run_id, event)
+            time.sleep(0.35)
+            self.assertTrue(thread.is_alive())
+            self.assertEqual(close.call_count, 0)
+            alive["value"] = False
+            thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(close.call_count, 0)
+
+
+    def test_exact_close_uses_only_the_tagged_session_target(self):
+        meta = self.owner_meta("4" * 32)
+        calls = []
+        with mock.patch.object(self.module, "owned_tmux_target_presence", return_value=True), mock.patch.object(
+            self.module, "tmux_run", side_effect=lambda args, **_: calls.append(args) or Result()
+        ):
+            self.assertTrue(self.module.close_owned_tmux_target(meta))
+        self.assertEqual(calls, [["kill-session", "-t", "=" + meta["tmux_window_name"]]])
+        self.assertNotIn("kill-window", calls[0])
+
+    def test_exact_nested_close_uses_owner_bridge_and_unlinks_only_recorded_link(self):
+        meta = self.owner_meta("5" * 32, kind="window")
+        calls = []
+        bridge_id = "$9"
+
+        def run(arguments, **_):
+            calls.append(arguments)
+            if arguments[0] == "new-session":
+                return Result(stdout=bridge_id + "\n")
+            return Result()
+
+        with mock.patch.object(
+            self.module, "owned_tmux_target_presence", return_value=True
+        ), mock.patch.object(self.module, "tmux_run", side_effect=run):
+            self.assertTrue(self.module.close_owned_tmux_target(meta))
+
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "new-session", "-d", "-P", "-F", "#{session_id}",
+                    "-s", self.module.tmux_owner_bridge_name(meta["tmux_owner_tag"]),
+                    "-n", "placeholder", "sleep 5",
+                ],
+                ["set-option", "-t", bridge_id, self.module.TMUX_OWNER_OPTION, meta["tmux_owner_tag"]],
+                ["link-window", "-s", meta["owned_window_link"], "-t", bridge_id + ":"],
+                ["unlink-window", "-t", meta["owned_window_link"]],
+                ["kill-session", "-t", bridge_id],
+            ],
+        )
+        self.assertFalse(any("-k" in call for call in calls))
+
+    def test_legacy_metadata_is_never_closed_or_cleaned_automatically(self):
+        run_id = "6" * 32
+        legacy = self.owner_meta(run_id)
+        legacy.pop("tmux_owner_tag")
+        legacy.pop("tmux_server_epoch")
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", legacy)
+        with mock.patch.object(self.module, "tmux_run") as tmux:
+            self.assertFalse(self.module.close_ended_owned_target(run_id))
+        tmux.assert_not_called()
+        self.assertEqual(self.module.get_meta(run_id)["state"], "end_cleanup_failed")
+
+    def test_final_server_close_allows_outer_cleanup_only_after_exact_success(self):
+        run_id = "7" * 32
+        meta = self.owner_meta(run_id)
+        meta.update(end_close_succeeded=True, end_close_generation=meta["tmux_server_epoch"])
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+        with mock.patch.object(self.module, "owned_tmux_target_presence", return_value=None), mock.patch.object(
+            self.module, "cleanup_run"
+        ) as cleanup:
+            self.assertTrue(self.module.observe_owned_target_disappearance(run_id))
+        cleanup.assert_called_once_with(run_id, True)
+
+    def test_outer_launcher_recovers_self_terminated_final_session_close(self):
+        run_id = "a" * 32
+        meta = self.owner_meta(run_id)
+        meta.update(
+            state="ending",
+            end_close_started_generation=meta["tmux_server_epoch"],
+        )
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+        with mock.patch.object(self.module, "owned_tmux_target_presence", return_value=None), mock.patch.object(
+            self.module, "tmux_server_generation_gone", return_value=True
+        ), mock.patch.object(self.module, "cleanup_run") as cleanup:
+            self.assertTrue(self.module.observe_owned_target_disappearance(run_id))
+        cleanup.assert_called_once_with(run_id, True)
+
+    def test_outer_launcher_waits_for_owner_monitor_success(self):
+        run_id = "d" * 32
+        meta = self.owner_meta(run_id)
+        meta.update(state="root_exited")
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+
+        with mock.patch.object(
+            self.module, "owned_tmux_target_presence", side_effect=[None, None]
+        ), mock.patch.object(
+            self.module, "successful_final_session_close", side_effect=[False, True]
+        ), mock.patch.object(self.module, "cleanup_run") as cleanup, mock.patch.object(
+            self.module, "mark_owned_tmux_close_failure"
+        ) as failed:
+            self.assertTrue(self.module.observe_owned_target_disappearance(run_id))
+
+        cleanup.assert_called_once_with(run_id, True)
+        failed.assert_not_called()
+
+    def test_outer_launcher_preserves_owner_monitor_failure_reason(self):
+        run_id = "e" * 32
+        meta = self.owner_meta(run_id)
+        meta.update(state="end_cleanup_failed", end_close_failure="close_command_failed")
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+
+        with mock.patch.object(
+            self.module, "owned_tmux_target_presence", return_value=None
+        ), mock.patch.object(self.module, "mark_owned_tmux_close_failure") as failed:
+            self.assertFalse(self.module.observe_owned_target_disappearance(run_id))
+
+        failed.assert_not_called()
+
+    def test_close_failure_retains_state_and_explicit_retry_can_finish(self):
+        run_id = "8" * 32
+        meta = self.owner_meta(run_id)
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+        with mock.patch.object(self.module, "owned_tmux_target_presence", return_value=True), mock.patch.object(
+            self.module, "close_owned_tmux_target", return_value=False
+        ):
+            self.assertFalse(self.module.close_ended_owned_target(run_id))
+        self.assertEqual(self.module.get_meta(run_id)["state"], "end_cleanup_failed")
+        with mock.patch.object(self.module, "owned_tmux_target_presence", side_effect=[True, False]), mock.patch.object(
+            self.module, "close_owned_tmux_target", return_value=True
+        ), mock.patch.object(self.module, "cleanup_run") as cleanup:
+            self.assertTrue(self.module.finish_owned_tmux_target(run_id))
+        cleanup.assert_called_once_with(run_id, True)
+
+    def test_tmux_generation_parser_is_locale_independent(self):
+        with mock.patch.dict(os.environ, {"LC_ALL": "zh_CN.UTF-8"}, clear=False), mock.patch.object(
+            self.module, "tmux_run", return_value=Result(stdout="123\t456\t/tmp/tmux.sock\n")
+        ):
+            self.assertEqual(self.module.tmux_server_epoch(), "123\t456\t/tmp/tmux.sock")
 
 
 if __name__ == "__main__":
