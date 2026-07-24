@@ -61,7 +61,7 @@ Our servers are currently overloaded. Please try again later.
 状态示例：
 
 ```text
-● Recovery ready · v1.0.6
+● Recovery ready · v1.0.7
 ◔ Service overloaded · recovery 1/3 in 14s · C-b X skip
 ● Submitting recovery 1/3
 ● Recovery 1/3 active

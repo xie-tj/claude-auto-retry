@@ -106,7 +106,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         cases = [
             (
                 self.module.status_text("ready", {"name": "demo"}),
-                "Recovery ready · v1.0.6",
+                "Recovery ready · v1.0.7",
             ),
             (
                 self.module.status_text(
@@ -195,9 +195,9 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(shortest, "[~] Recovery 1/3 14s")
         self.assertEqual(
             self.module.present_status(
-                "ready", "Recovery ready · v1.0.6", width=80, color=False, unicode=False
+                "ready", "Recovery ready · v1.0.7", width=80, color=False, unicode=False
             ),
-            "[o] Recovery ready | v1.0.6",
+            "[o] Recovery ready | v1.0.7",
         )
         self.assertEqual(
             self.module.present_status(
@@ -285,14 +285,14 @@ class RuntimeSafetyTests(unittest.TestCase):
             side_effect=lambda arguments, **_: calls.append(arguments) or Result(),
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "border", meta
+                "ready", "Recovery ready · v1.0.7", "border", meta
             )
 
         self.assertEqual(
             calls,
             [[
                 "set-option", "-w", "-t", "@7", "@claude_auto_watchdog_status",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.7",
             ]],
         )
 
@@ -309,11 +309,11 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module, "tmux_run", side_effect=tmux_run
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "border",
+                "ready", "Recovery ready · v1.0.7", "border",
                 {"window_id": "@7"},
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "border",
+                "ready", "Recovery ready · v1.0.7", "border",
                 {"window_id": "@7"}, failed_frame,
             )
 
@@ -323,7 +323,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             (
                 "border",
                 "@7",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.7",
             ),
         )
         self.assertEqual(len(attempts), 2)
@@ -442,7 +442,7 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.7",
                 "#[dim]○#[default] Recovery paused globally · claude-auto resume",
             ],
         )
@@ -503,8 +503,8 @@ class RuntimeSafetyTests(unittest.TestCase):
         self.assertEqual(
             status_values,
             [
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
-                "#[fg=cyan]●#[default] Recovery ready · v1.0.6",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.7",
+                "#[fg=cyan]●#[default] Recovery ready · v1.0.7",
             ],
         )
 
@@ -1262,7 +1262,7 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", return_value=os.terminal_size((80, 24))
         ):
             self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}
+                "ready", "Recovery ready · v1.0.7", "pane", {}
             )
         rendered = buffer.getvalue()
         self.assertIn("\x1b[36m●\x1b[0m", rendered)
@@ -1281,13 +1281,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             return_value=os.terminal_size((80, 24)),
         ):
             failed_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}
+                "ready", "Recovery ready · v1.0.7", "pane", {}
             )
             rendered_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}, failed_frame
+                "ready", "Recovery ready · v1.0.7", "pane", {}, failed_frame
             )
             same_frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}, rendered_frame
+                "ready", "Recovery ready · v1.0.7", "pane", {}, rendered_frame
             )
 
         self.assertIsNone(failed_frame)
@@ -1316,13 +1316,13 @@ class RuntimeSafetyTests(unittest.TestCase):
             self.module.shutil, "get_terminal_size", side_effect=sizes
         ):
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}
+                "ready", "Recovery ready · v1.0.7", "pane", {}
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.7", "pane", {}, frame
             )
             frame = self.module.render_watchdog_status(
-                "ready", "Recovery ready · v1.0.6", "pane", {}, frame
+                "ready", "Recovery ready · v1.0.7", "pane", {}, frame
             )
 
         self.assertEqual(output.write.call_count, 2)
@@ -2159,6 +2159,61 @@ class RuntimeSafetyTests(unittest.TestCase):
         meta = self.module.read_json(run_directories[0] / "meta.json", {})
         self.assertEqual(meta["state"], "crashed")
         self.assertFalse(self.module.lock_name("session", "session-1").exists())
+
+    def test_crashed_watchdog_cleanup_does_not_admit_resume_while_owned_pane_lives(self):
+        run_id = "d" * 32
+        session_id = "00000000-0000-4000-8000-000000000000"
+        self.create_run(
+            run_id,
+            mode="interactive",
+            session_id=session_id,
+            main_pane="%owned",
+            tmux_identity="owned-pane-identity",
+            owned_target="session",
+            tmux_owner_tag="a" * 64,
+        )
+        self.assertEqual(
+            self.module.acquire_initial_locks(run_id, session_id, False, str(self.home)),
+            (True, None, None),
+        )
+
+        with mock.patch.object(self.module, "tmux_target_alive", return_value=True):
+            self.module.cleanup_run(run_id, False)
+            self.assertEqual(self.module.get_meta(run_id)["state"], "crashed")
+            self.assertTrue(self.module.tmux_target_alive("%owned", "owned-pane-identity"))
+            admitted, _, _ = self.module.acquire_initial_locks(
+                "e" * 32, session_id, False, str(self.home)
+            )
+
+        self.assertFalse(
+            admitted,
+            "a resume must remain blocked while the crashed run still owns a live pane",
+        )
+
+    def test_stale_crashed_run_releases_lock_after_owned_pane_disappears(self):
+        run_id = "f" * 32
+        session_id = "00000000-0000-4000-8000-000000000001"
+        self.create_run(
+            run_id,
+            state="crashed",
+            session_id=session_id,
+            supervisor_pid=0,
+            supervisor_identity="dead-supervisor",
+            main_pane="%gone",
+            tmux_identity="gone-pane-identity",
+        )
+        self.assertEqual(
+            self.module.acquire_initial_locks(run_id, session_id, False, str(self.home)),
+            (True, None, None),
+        )
+
+        with mock.patch.object(self.module, "tmux_target_alive", return_value=False):
+            self.module.cleanup_stale()
+            admitted, _, _ = self.module.acquire_initial_locks(
+                "0" * 32, session_id, False, str(self.home)
+            )
+
+        self.assertTrue(admitted)
 
     def test_stale_pid_or_tmux_identity_is_not_live(self):
         run_id = "3" * 32
@@ -3219,6 +3274,39 @@ class RuntimeSafetyTests(unittest.TestCase):
         ) as close:
             self.assertEqual(self.module.owner_monitor_main(run_id), 0)
         close.assert_called_once_with(run_id)
+
+    def test_owner_monitor_waits_through_watchdog_crash_for_root_exit(self):
+        run_id = "c" * 32
+        self.create_run(run_id, state="crashed")
+
+        def root_exits(_):
+            self.module.update_meta(run_id, state="root_exited", root_exit_code=0)
+
+        with mock.patch.object(
+            self.module, "close_ended_owned_target", return_value=True
+        ) as close, mock.patch.object(self.module.time, "sleep", side_effect=root_exits) as sleep:
+            self.assertEqual(self.module.owner_monitor_main(run_id), 0)
+
+        sleep.assert_called_once_with(0.05)
+        close.assert_called_once_with(run_id)
+
+    def test_owner_monitor_never_closes_identity_mismatched_target(self):
+        run_id = "d" * 32
+        meta = self.owner_meta(run_id)
+        meta.update(state="root_exited", tmux_window_name="identity-mismatch")
+        directory = self.module.run_dir(run_id)
+        directory.mkdir(parents=True)
+        self.module.atomic_json(directory / "meta.json", meta)
+
+        with mock.patch.object(
+            self.module, "owned_tmux_target_presence", return_value=None
+        ), mock.patch.object(
+            self.module, "tmux_server_generation_gone", return_value=False
+        ), mock.patch.object(self.module, "tmux_run") as tmux:
+            self.assertEqual(self.module.owner_monitor_main(run_id), 1)
+
+        tmux.assert_not_called()
+        self.assertEqual(self.module.get_meta(run_id)["state"], "end_cleanup_failed")
 
     def test_finished_tmux_generation_accepts_a_stale_socket_path(self):
         meta = {"tmux_server_epoch": "4242\t100\t/tmp/stale-tmux.sock"}

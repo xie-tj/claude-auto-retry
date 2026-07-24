@@ -20,7 +20,7 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 HOME = Path.home()
 APP_DIR = Path(os.environ.get("CLAUDE_AUTO_APP_DIR", HOME / ".local" / "share" / "claude-auto"))
 STATE_DIR = Path(os.environ.get("CLAUDE_AUTO_STATE_DIR", HOME / ".local" / "state" / "claude-auto"))
@@ -1335,8 +1335,14 @@ def cleanup_run(run_id, normal):
     except ValueError:
         return
     restore_watchdog_border(meta)
-    release_named_lock("session", meta.get("session_id"), run_id)
-    release_named_lock("project", meta.get("project_lock"), run_id)
+    preserve_live_interactive_lock = (
+        not normal
+        and meta.get("mode") == "interactive"
+        and tmux_target_alive(meta.get("main_pane"), meta.get("tmux_identity"))
+    )
+    if not preserve_live_interactive_lock:
+        release_named_lock("session", meta.get("session_id"), run_id)
+        release_named_lock("project", meta.get("project_lock"), run_id)
     update_meta(run_id, state="exited" if normal else "crashed", ended_at=time.time())
     release_tmux_binding(run_id)
     directory = run_dir(run_id)
@@ -2029,7 +2035,7 @@ def owner_monitor_main(run_id):
         state = meta.get("state")
         if state == "root_exited":
             return 0 if close_ended_owned_target(run_id) else 1
-        if state in {"end_cleanup_failed", "exited", "crashed"}:
+        if state in {"end_cleanup_failed", "exited"}:
             return 0 if state == "exited" else 1
         time.sleep(0.05)
     return 0 if not directory.exists() else 1
